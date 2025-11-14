@@ -1,0 +1,18 @@
+[Unit]
+Description=ZFS NFS HA Replication Timer
+Requires=zfs-nfs-replica.service
+
+[Timer]
+# Démarrage initial : 5 minutes après le boot
+OnBootSec=5min
+
+# Exécution périodique : toutes les 10 minutes
+OnUnitActiveSec=10min
+
+# Précision du timer (par défaut 1 minute)
+AccuracySec=1min
+
+Unit=zfs-nfs-replica.service
+
+[Install]
+WantedBy=timers.target

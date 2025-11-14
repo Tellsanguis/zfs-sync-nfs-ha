@@ -1,0 +1,35 @@
+[Unit]
+Description=ZFS NFS HA Replication Service
+After=zfs-import.target zfs-mount.service pve-ha-lrm.service
+Requires=zfs-import.target zfs-mount.service
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/zfs-nfs-replica.sh
+
+# Sécurité
+User=root
+Group=root
+
+# Ne pas redémarrer automatiquement en cas d'échec
+# (le timer s'en chargera à la prochaine exécution)
+Restart=no
+
+# Timeout de 30 minutes (réplication peut être longue)
+TimeoutStartSec=1800
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=zfs-nfs-replica
+
+# Ressources
+# Limiter l'utilisation CPU pour ne pas impacter les services
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target
