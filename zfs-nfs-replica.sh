@@ -8,9 +8,10 @@
 # - Détermine le nœud distant automatiquement
 # - Réplique le dataset ZFS vers le nœud passif
 # - Utilise un verrou pour éviter les réplications concurrentes
+# - Gère l'activation/désactivation de Sanoid selon le nœud actif
 #
 # Auteur : BENE Maël
-# Version : 1.0
+# Version : 1.1
 #
 
 set -euo pipefail
@@ -92,6 +93,34 @@ verify_lxc_is_active() {
     fi
 }
 
+# Gestion de Sanoid selon le nœud actif
+manage_sanoid() {
+    local action="$1"  # "enable" ou "disable"
+
+    if [[ "$action" == "enable" ]]; then
+        # Activer Sanoid sur le nœud actif
+        if systemctl is-enabled sanoid.timer &>/dev/null; then
+            if ! systemctl is-active sanoid.timer &>/dev/null; then
+                log "info" "Activation de Sanoid sur le nœud actif"
+                systemctl start sanoid.timer
+            fi
+        else
+            log "info" "Activation et démarrage de Sanoid sur le nœud actif"
+            systemctl enable --now sanoid.timer
+        fi
+    elif [[ "$action" == "disable" ]]; then
+        # Désactiver Sanoid sur le nœud passif
+        if systemctl is-active sanoid.timer &>/dev/null; then
+            log "info" "Désactivation de Sanoid sur le nœud passif"
+            systemctl stop sanoid.timer
+        fi
+        if systemctl is-enabled sanoid.timer &>/dev/null; then
+            log "info" "Désactivation permanente de Sanoid sur le nœud passif"
+            systemctl disable sanoid.timer
+        fi
+    fi
+}
+
 # Détermination du nœud local et distant
 LOCAL_NODE=$(hostname)
 log "info" "Démarrage du script sur le nœud: ${LOCAL_NODE}"
@@ -117,8 +146,13 @@ log "info" "Nœud distant configuré: ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
 # Triple vérification de sécurité
 if ! verify_lxc_is_active; then
     log "info" "Le LXC ${CTID} n'est pas actif sur ce nœud. Pas de réplication nécessaire."
+    # Désactiver Sanoid sur le nœud passif
+    manage_sanoid "disable"
     exit 0
 fi
+
+# Le LXC est actif ici : activer Sanoid sur ce nœud
+manage_sanoid "enable"
 
 # Vérification de l'existence du pool
 if ! zpool list "$ZPOOL" &>/dev/null; then
