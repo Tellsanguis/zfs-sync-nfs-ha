@@ -11,7 +11,7 @@
 # - Gère l'activation/désactivation de Sanoid selon le nœud actif
 #
 # Auteur : BENE Maël
-# Version : 1.4
+# Version : 1.5
 #
 
 set -euo pipefail
@@ -439,8 +439,35 @@ else
     SYNCOID_OPTS="--recursive --force-delete"
 fi
 
-# Lancer la réplication avec les options appropriées
-if syncoid $SYNCOID_OPTS "$ZPOOL" "root@${REMOTE_NODE_IP}:$ZPOOL"; then
+# Lister les datasets de premier niveau sous le pool
+# (on ne réplique pas le pool racine lui-même, seulement ses enfants directs)
+FIRST_LEVEL_DATASETS=$(zfs list -H -o name -r "$ZPOOL" -t filesystem,volume -d 1 | grep -v "^${ZPOOL}$")
+
+if [[ -z "$FIRST_LEVEL_DATASETS" ]]; then
+    log "error" "Aucun dataset trouvé sous ${ZPOOL}"
+    exit 1
+fi
+
+log "info" "Datasets à répliquer:"
+echo "$FIRST_LEVEL_DATASETS" | while read -r dataset; do
+    log "info" "  - ${dataset}"
+done
+
+# Lancer la réplication pour chaque dataset de premier niveau
+# Chaque réplication est récursive, donc elle inclut tous les datasets enfants
+REPLICATION_SUCCESS=true
+echo "$FIRST_LEVEL_DATASETS" | while read -r dataset; do
+    log "info" "=== Réplication de ${dataset} (récursif) ==="
+
+    if syncoid $SYNCOID_OPTS "$dataset" "root@${REMOTE_NODE_IP}:${dataset}"; then
+        log "info" "✓ ${dataset} répliqué avec succès"
+    else
+        log "error" "✗ Échec de la réplication de ${dataset}"
+        REPLICATION_SUCCESS=false
+    fi
+done
+
+if [[ "$REPLICATION_SUCCESS" == "true" ]]; then
     log "info" "✓ Réplication récursive réussie vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
     log "info" "  Tous les datasets de ${ZPOOL} ont été synchronisés"
 
