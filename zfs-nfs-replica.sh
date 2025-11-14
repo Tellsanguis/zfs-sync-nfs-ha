@@ -11,7 +11,7 @@
 # - Gère l'activation/désactivation de Sanoid selon le nœud actif
 #
 # Auteur : BENE Maël
-# Version : 1.1
+# Version : 1.2
 #
 
 set -euo pipefail
@@ -23,6 +23,10 @@ ZPOOL="zpool1"  # Pool entier à répliquer (tous les datasets)
 CHECK_DELAY=2  # Délai entre chaque vérification (secondes)
 LOG_FACILITY="local0"
 SSH_KEY="/root/.ssh/id_ed25519_zfs_replication"
+STATE_DIR="/var/lib/zfs-nfs-replica"
+SIZES_FILE="${STATE_DIR}/last-sync-sizes.txt"
+SIZE_TOLERANCE=20  # Tolérance de variation en pourcentage (±20%)
+MIN_REMOTE_RATIO=50  # Le distant doit avoir au moins 50% de la taille du local
 
 # Fonction de logging
 log() {
@@ -121,6 +125,206 @@ manage_sanoid() {
     fi
 }
 
+# Vérification de l'existence de snapshots en commun
+check_common_snapshots() {
+    local remote_ip="$1"
+    local pool="$2"
+
+    log "info" "Vérification des snapshots en commun entre les nœuds..."
+
+    # Récupérer les snapshots locaux
+    local local_snaps
+    local_snaps=$(zfs list -t snapshot -r "$pool" -o name -H 2>/dev/null | sort || true)
+
+    # Récupérer les snapshots distants
+    local remote_snaps
+    remote_snaps=$(ssh -i "$SSH_KEY" "root@${remote_ip}" "zfs list -t snapshot -r ${pool} -o name -H 2>/dev/null | sort" || true)
+
+    # Si pas de snapshots distants, c'est une première sync
+    if [[ -z "$remote_snaps" ]]; then
+        log "warning" "Aucun snapshot trouvé sur le nœud distant"
+        return 1
+    fi
+
+    # Si pas de snapshots locaux (ne devrait pas arriver avec Sanoid actif)
+    if [[ -z "$local_snaps" ]]; then
+        log "warning" "Aucun snapshot trouvé sur le nœud local"
+        return 1
+    fi
+
+    # Chercher des snapshots en commun
+    local common_snaps
+    common_snaps=$(comm -12 <(echo "$local_snaps") <(echo "$remote_snaps"))
+
+    if [[ -n "$common_snaps" ]]; then
+        local count
+        count=$(echo "$common_snaps" | wc -l)
+        log "info" "✓ ${count} snapshot(s) en commun trouvé(s)"
+        return 0
+    else
+        log "warning" "✗ Aucun snapshot en commun trouvé"
+        return 1
+    fi
+}
+
+# Récupération des tailles de datasets
+get_dataset_sizes() {
+    local target="$1"  # "local" ou "remote:IP"
+    local pool="$2"
+
+    if [[ "$target" == "local" ]]; then
+        zfs list -r "$pool" -o name,used -Hp 2>/dev/null || true
+    else
+        local remote_ip="${target#remote:}"
+        ssh -i "$SSH_KEY" "root@${remote_ip}" "zfs list -r ${pool} -o name,used -Hp 2>/dev/null" || true
+    fi
+}
+
+# Sauvegarde des tailles de datasets après sync réussie
+save_dataset_sizes() {
+    local pool="$1"
+
+    log "info" "Sauvegarde des tailles de datasets dans ${SIZES_FILE}"
+
+    # Créer le répertoire si nécessaire
+    mkdir -p "$STATE_DIR"
+
+    # Sauvegarder avec timestamp
+    {
+        echo "timestamp=$(date '+%Y-%m-%d_%H:%M:%S')"
+        get_dataset_sizes "local" "$pool" | awk '{print $1"="$2}'
+    } > "$SIZES_FILE"
+
+    log "info" "✓ Tailles sauvegardées"
+}
+
+# Vérification de sécurité des tailles avant --force-delete
+check_size_safety() {
+    local remote_ip="$1"
+    local pool="$2"
+
+    log "info" "=== Vérifications de sécurité avant --force-delete ==="
+
+    # Récupérer les tailles actuelles
+    local local_sizes
+    local_sizes=$(get_dataset_sizes "local" "$pool")
+
+    local remote_sizes
+    remote_sizes=$(get_dataset_sizes "remote:${remote_ip}" "$pool")
+
+    if [[ -z "$local_sizes" ]] || [[ -z "$remote_sizes" ]]; then
+        log "error" "✗ Impossible de récupérer les tailles des datasets"
+        return 1
+    fi
+
+    # Vérifier si un historique existe (indique que ce nœud a déjà été actif)
+    local has_history=false
+    if [[ -f "$SIZES_FILE" ]]; then
+        has_history=true
+    fi
+
+    # === SÉCURITÉ 1 : Comparaison source/destination ===
+    # Cette vérification s'applique UNIQUEMENT s'il existe un historique
+    # (pour éviter de bloquer la première installation légitime)
+    if [[ "$has_history" == "true" ]]; then
+        log "info" "Vérification #1: Comparaison des tailles source/destination (historique détecté)"
+
+        local dataset size_local size_remote ratio
+        while IFS=$'\t' read -r dataset size_local; do
+            # Trouver la taille correspondante sur le distant
+            size_remote=$(echo "$remote_sizes" | grep "^${dataset}" | awk '{print $2}')
+
+            if [[ -n "$size_remote" ]]; then
+                # Protection contre division par zéro et source plus petite que destination
+                if [[ "$size_local" -eq 0 ]] && [[ "$size_remote" -gt 0 ]]; then
+                    log "error" "✗ SÉCURITÉ: Dataset ${dataset}"
+                    log "error" "  Local (source): 0B (VIDE)"
+                    log "error" "  Distant (destination): $(numfmt --to=iec-i --suffix=B "$size_remote")"
+                    log "error" "  Le nœud LOCAL est vide alors que le DISTANT contient des données"
+                    log "error" "  Cela indiquerait un disque de remplacement vide devenu actif par erreur"
+                    log "error" "  REFUS de --force-delete pour éviter d'écraser les données du nœud distant"
+                    return 1
+                fi
+
+                if [[ "$size_local" -gt 0 ]]; then
+                    # Calculer le ratio distant/local (le distant doit avoir au moins 50% du local)
+                    ratio=$((size_remote * 100 / size_local))
+
+                    if [[ $ratio -lt $MIN_REMOTE_RATIO ]]; then
+                        log "error" "✗ SÉCURITÉ: Dataset ${dataset}"
+                        log "error" "  Local (source): $(numfmt --to=iec-i --suffix=B "$size_local")"
+                        log "error" "  Distant (destination): $(numfmt --to=iec-i --suffix=B "$size_remote")"
+                        log "error" "  Ratio: ${ratio}% (minimum requis: ${MIN_REMOTE_RATIO}%)"
+                        log "error" "  Le nœud distant semble avoir des données incomplètes ou vides"
+                        log "error" "  REFUS de --force-delete pour éviter la perte de données"
+                        return 1
+                    fi
+
+                    # Vérification inverse : source ne doit pas être significativement plus petite que destination
+                    local inverse_ratio
+                    inverse_ratio=$((size_local * 100 / size_remote))
+
+                    if [[ $inverse_ratio -lt $MIN_REMOTE_RATIO ]]; then
+                        log "error" "✗ SÉCURITÉ: Dataset ${dataset}"
+                        log "error" "  Local (source): $(numfmt --to=iec-i --suffix=B "$size_local")"
+                        log "error" "  Distant (destination): $(numfmt --to=iec-i --suffix=B "$size_remote")"
+                        log "error" "  Ratio inverse: ${inverse_ratio}% (minimum requis: ${MIN_REMOTE_RATIO}%)"
+                        log "error" "  La SOURCE est plus petite que la DESTINATION"
+                        log "error" "  Cela indiquerait un disque de remplacement devenu actif par erreur"
+                        log "error" "  REFUS de --force-delete pour éviter d'écraser des données avec un disque vide"
+                        return 1
+                    fi
+                fi
+            fi
+        done <<< "$local_sizes"
+
+        log "info" "✓ Vérification #1 réussie: Les tailles sont cohérentes entre les nœuds"
+    else
+        log "info" "Vérification #1 ignorée: Première activation de ce nœud (pas d'historique)"
+        log "info" "  Il est normal que le nœud distant soit vide lors de la première installation"
+    fi
+
+    # === SÉCURITÉ 2 : Comparaison avec historique ===
+    if [[ "$has_history" == "true" ]]; then
+        log "info" "Vérification #2: Comparaison avec l'historique des tailles"
+
+        local previous_timestamp
+        previous_timestamp=$(grep "^timestamp=" "$SIZES_FILE" | cut -d= -f2)
+        log "info" "Dernière synchronisation réussie: ${previous_timestamp}"
+
+        local dataset size_remote size_previous diff_percent
+        while IFS=$'\t' read -r dataset size_remote; do
+            # Récupérer la taille précédente
+            size_previous=$(grep "^${dataset}=" "$SIZES_FILE" | cut -d= -f2)
+
+            if [[ -n "$size_previous" ]] && [[ "$size_previous" -gt 0 ]]; then
+                # Calculer la différence en pourcentage
+                local diff
+                diff=$((size_remote > size_previous ? size_remote - size_previous : size_previous - size_remote))
+                diff_percent=$((diff * 100 / size_previous))
+
+                if [[ $diff_percent -gt $SIZE_TOLERANCE ]]; then
+                    log "error" "✗ SÉCURITÉ: Dataset ${dataset}"
+                    log "error" "  Taille précédente: $(numfmt --to=iec-i --suffix=B "$size_previous")"
+                    log "error" "  Taille actuelle: $(numfmt --to=iec-i --suffix=B "$size_remote")"
+                    log "error" "  Variation: ${diff_percent}% (tolérance: ±${SIZE_TOLERANCE}%)"
+                    log "error" "  Variation anormale détectée depuis la dernière sync"
+                    log "error" "  REFUS de --force-delete pour éviter la perte de données"
+                    return 1
+                fi
+            fi
+        done <<< "$remote_sizes"
+
+        log "info" "✓ Vérification #2 réussie: Les tailles sont cohérentes avec l'historique"
+    else
+        log "info" "Vérification #2 ignorée: Pas d'historique de tailles (première activation)"
+    fi
+
+    log "info" "=== ✓ Toutes les vérifications de sécurité sont passées ==="
+    log "info" "=== Autorisation de --force-delete accordée ==="
+    return 0
+}
+
 # Détermination du nœud local et distant
 LOCAL_NODE=$(hostname)
 log "info" "Démarrage du script sur le nœud: ${LOCAL_NODE}"
@@ -197,15 +401,50 @@ if ! ssh -i "$SSH_KEY" "root@${REMOTE_NODE_IP}" "zpool list ${ZPOOL}" &>/dev/nul
     exit 1
 fi
 
-# Réplication avec syncoid (récursive pour tous les datasets)
+# Vérification des snapshots en commun et choix de la stratégie de réplication
 log "info" "Début de la réplication récursive: ${ZPOOL} → ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP}):${ZPOOL}"
 
 # Syncoid utilise les options SSH via la variable d'environnement SSH
 export SSH="ssh -i ${SSH_KEY}"
 
-if syncoid --recursive --no-sync-snap --quiet "$ZPOOL" "root@${REMOTE_NODE_IP}:$ZPOOL"; then
+# Déterminer si c'est une première synchronisation
+SYNCOID_OPTS="--recursive --no-sync-snap --quiet"
+
+if check_common_snapshots "$REMOTE_NODE_IP" "$ZPOOL"; then
+    # Snapshots en commun : réplication incrémentale normale
+    log "info" "Mode: Réplication incrémentale (snapshots en commun détectés)"
+else
+    # Pas de snapshots en commun : première synchronisation avec --force-delete
+    log "warning" "Mode: Première synchronisation détectée"
+    log "warning" "Utilisation de --force-delete pour écraser les datasets incompatibles"
+
+    # SÉCURITÉ : Vérifier les tailles avant d'autoriser --force-delete
+    if ! check_size_safety "$REMOTE_NODE_IP" "$ZPOOL"; then
+        log "error" "╔════════════════════════════════════════════════════════════════╗"
+        log "error" "║ ARRÊT DE SÉCURITÉ                                              ║"
+        log "error" "║ Les vérifications de sécurité ont échoué.                     ║"
+        log "error" "║ --force-delete REFUSÉ pour éviter une perte de données.       ║"
+        log "error" "║                                                                ║"
+        log "error" "║ Actions possibles :                                            ║"
+        log "error" "║ 1. Vérifier manuellement les tailles des datasets             ║"
+        log "error" "║ 2. Si changement de disque : supprimer ${SIZES_FILE}          ║"
+        log "error" "║ 3. Vérifier que le bon nœud est actif (LXC sur le bon nœud)   ║"
+        log "error" "╚════════════════════════════════════════════════════════════════╝"
+        exit 1
+    fi
+
+    log "info" "Note: Les blocs de données existants seront réutilisés (pas de transfert complet)"
+    SYNCOID_OPTS="${SYNCOID_OPTS} --force-delete"
+fi
+
+# Lancer la réplication avec les options appropriées
+if syncoid $SYNCOID_OPTS "$ZPOOL" "root@${REMOTE_NODE_IP}:$ZPOOL"; then
     log "info" "✓ Réplication récursive réussie vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
     log "info" "  Tous les datasets de ${ZPOOL} ont été synchronisés"
+
+    # Sauvegarder les tailles après sync réussie
+    save_dataset_sizes "$ZPOOL"
+
     exit 0
 else
     log "error" "✗ Échec de la réplication vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"

@@ -112,9 +112,45 @@ Sanoid crée des snapshots selon un calendrier défini :
 - **Mensuel** : 3 snapshots (rétention de 3 mois)
 - **Annuel** : 1 snapshot (rétention de 1 an)
 
+**Activation intelligente** : Sanoid est automatiquement activé uniquement sur le nœud actif (celui qui héberge le LXC) et désactivé sur le nœud passif, évitant ainsi les conflits de snapshots.
+
+### Détection Automatique de Première Synchronisation
+
+Le script détecte automatiquement s'il s'agit d'une première synchronisation ou d'une réplication incrémentale :
+
+**Réplication incrémentale** (snapshots en commun détectés) :
+- Utilise les snapshots existants pour une synchronisation efficace
+- Transfert uniquement des deltas (modifications depuis le dernier snapshot)
+- Rapide et économe en bande passante
+
+**Première synchronisation** (aucun snapshot en commun) :
+- Active automatiquement le mode `--force-delete` de syncoid
+- Déclenche les vérifications de sécurité avancées avant toute opération
+- Réutilise les blocs de données existants pour éviter un transfert complet
+
+### Protections Anti-Écrasement
+
+Le script intègre un système de sécurité à deux niveaux pour éviter la perte de données lors d'une première synchronisation :
+
+**Protection 1 : Comparaison source/destination**
+- Vérifie que les tailles des datasets sont cohérentes entre les nœuds
+- Refuse la synchronisation si la source est significativement plus petite que la destination (ratio < 50%)
+- Détecte les scénarios de disque de remplacement vide devenu actif par erreur
+
+**Protection 2 : Historique des tailles**
+- Enregistre les tailles de tous les datasets après chaque synchronisation réussie
+- Compare avec l'historique lors des synchronisations suivantes
+- Refuse si variation anormale détectée (> 20% depuis la dernière synchronisation)
+- Fichier d'état : `/var/lib/zfs-nfs-replica/last-sync-sizes.txt`
+
+Ces protections garantissent qu'un disque vide ne pourra jamais écraser accidentellement des données existantes.
+
 ## Fonctionnalités
 
 - **Réplication bidirectionnelle automatique** : S'adapte aux migrations Proxmox HA sans intervention manuelle
+- **Détection automatique première sync/incrémentale** : Bascule automatiquement entre mode initial et mode incrémental
+- **Gestion automatique de Sanoid** : Active/désactive Sanoid selon le nœud actif pour éviter les conflits de snapshots
+- **Double protection anti-écrasement** : Vérifications de cohérence des tailles et historique pour prévenir toute perte de données
 - **Synchronisation récursive du pool** : Tous les datasets sous `zpool1` sont automatiquement inclus
 - **Contrôle de concurrence par verrou** : Empêche les tâches de réplication simultanées
 - **Gestion d'erreurs complète** : Valide la connectivité SSH, l'existence du pool et les opérations ZFS
@@ -194,7 +230,7 @@ ha-manager migrate ct:103 elitedesk
 
 - **RPO** : Un intervalle de réplication de 10 minutes signifie une perte de données potentielle jusqu'à 10 minutes dans des scénarios catastrophiques
 - **Bande passante USB** : Vitesse de réplication limitée par le débit USB 3.0 (adapté aux données froides)
-- **Synchronisation initiale manuelle** : La première réplication depuis le nœud rempli doit être initiée manuellement (voir INSTALLATION.md)
+- **Première synchronisation** : La détection automatique et les protections de sécurité peuvent nécessiter 10-20 minutes lors de la première exécution
 - **Point unique de défaillance** : Une panne du nœud actif nécessite une migration HA avant que les données ne soient accessibles
 - **Dépendance réseau** : La réplication nécessite une connectivité réseau stable entre les nœuds
 
