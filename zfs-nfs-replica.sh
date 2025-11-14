@@ -11,7 +11,7 @@
 # - Gère l'activation/désactivation de Sanoid selon le nœud actif
 #
 # Auteur : BENE Maël
-# Version : 1.3
+# Version : 1.4
 #
 
 set -euo pipefail
@@ -411,7 +411,7 @@ export SSH="ssh -i ${SSH_KEY}"
 if check_common_snapshots "$REMOTE_NODE_IP" "$ZPOOL"; then
     # Snapshots en commun : réplication incrémentale normale
     log "info" "Mode: Réplication incrémentale (snapshots en commun détectés)"
-    SYNCOID_OPTS="--recursive --no-sync-snap --quiet"
+    SYNCOID_OPTS="--recursive --no-sync-snap"
 else
     # Pas de snapshots en commun : première synchronisation avec --force-delete
     log "warning" "Mode: Première synchronisation détectée"
@@ -436,7 +436,7 @@ else
     log "info" "      Les blocs de données existants seront réutilisés (pas de transfert complet)"
     # Pour la première sync: pas de --no-sync-snap (on veut que syncoid crée un snapshot)
     # mais on garde --force-delete pour écraser les datasets vides/incompatibles
-    SYNCOID_OPTS="--recursive --force-delete --quiet"
+    SYNCOID_OPTS="--recursive --force-delete"
 fi
 
 # Lancer la réplication avec les options appropriées
