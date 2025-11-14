@@ -11,7 +11,7 @@
 # - Gère l'activation/désactivation de Sanoid selon le nœud actif
 #
 # Auteur : BENE Maël
-# Version : 1.5
+# Version : 1.5.1
 #
 
 set -euo pipefail
@@ -449,25 +449,26 @@ if [[ -z "$FIRST_LEVEL_DATASETS" ]]; then
 fi
 
 log "info" "Datasets à répliquer:"
-echo "$FIRST_LEVEL_DATASETS" | while read -r dataset; do
+while read -r dataset; do
     log "info" "  - ${dataset}"
-done
+done <<< "$FIRST_LEVEL_DATASETS"
 
 # Lancer la réplication pour chaque dataset de premier niveau
 # Chaque réplication est récursive, donc elle inclut tous les datasets enfants
-REPLICATION_SUCCESS=true
-echo "$FIRST_LEVEL_DATASETS" | while read -r dataset; do
+REPLICATION_FAILED=0
+
+while read -r dataset; do
     log "info" "=== Réplication de ${dataset} (récursif) ==="
 
     if syncoid $SYNCOID_OPTS "$dataset" "root@${REMOTE_NODE_IP}:${dataset}"; then
         log "info" "✓ ${dataset} répliqué avec succès"
     else
         log "error" "✗ Échec de la réplication de ${dataset}"
-        REPLICATION_SUCCESS=false
+        REPLICATION_FAILED=1
     fi
-done
+done <<< "$FIRST_LEVEL_DATASETS"
 
-if [[ "$REPLICATION_SUCCESS" == "true" ]]; then
+if [[ $REPLICATION_FAILED -eq 0 ]]; then
     log "info" "✓ Réplication récursive réussie vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
     log "info" "  Tous les datasets de ${ZPOOL} ont été synchronisés"
 
