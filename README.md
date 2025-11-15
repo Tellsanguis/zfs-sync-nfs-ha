@@ -147,6 +147,7 @@ Ces protections garantissent qu'un disque vide ne pourra jamais écraser acciden
 
 ## Fonctionnalités
 
+- **Mise à jour automatique** : Le script vérifie et installe automatiquement les nouvelles versions depuis le dépôt Forgejo avant chaque exécution
 - **Réplication bidirectionnelle automatique** : S'adapte aux migrations Proxmox HA sans intervention manuelle
 - **Détection automatique première sync/incrémentale** : Bascule automatiquement entre mode initial et mode incrémental
 - **Gestion automatique de Sanoid** : Active/désactive Sanoid selon le nœud actif pour éviter les conflits de snapshots
@@ -163,10 +164,33 @@ Ces protections garantissent qu'un disque vide ne pourra jamais écraser acciden
 ```
 .
 ├── README.md                    # Ce fichier
-├── zfs-nfs-replica.sh           # Script principal de réplication
+├── zfs-nfs-replica.sh           # Script principal de réplication (version 1.6.0)
 ├── zfs-nfs-replica.service      # Définition du service systemd
 └── zfs-nfs-replica.timer        # Configuration du timer systemd
 ```
+
+### Système de Mise à Jour Automatique
+
+Le script intègre un système d'auto-update qui vérifie et installe automatiquement les nouvelles versions depuis le dépôt Forgejo :
+
+**Fonctionnement** :
+- Vérifie la version distante à chaque exécution du script
+- Télécharge et compare avec la version locale
+- Crée une sauvegarde de l'ancienne version (`.backup-X.Y.Z`)
+- Installe la nouvelle version automatiquement
+- Redémarre le script avec la nouvelle version
+- Échoue en sécurité si la mise à jour rencontre une erreur
+
+**Configuration** :
+- Activé par défaut (`AUTO_UPDATE_ENABLED=true` dans le script)
+- Peut être désactivé en modifiant `AUTO_UPDATE_ENABLED=false`
+- Dépôt source : `https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha`
+
+**Sécurité** :
+- Protection contre les boucles infinies (variable `SKIP_AUTO_UPDATE`)
+- Sauvegarde automatique avant mise à jour
+- Restauration en cas d'échec
+- Journalisation complète des opérations de mise à jour
 
 ## Utilisation
 

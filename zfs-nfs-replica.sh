@@ -11,12 +11,18 @@
 # - Gère l'activation/désactivation de Sanoid selon le nœud actif
 #
 # Auteur : BENE Maël
-# Version : 1.5.1
+# Version : 1.6.0
 #
 
 set -euo pipefail
 
 # Configuration
+SCRIPT_VERSION="1.6.0"
+REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
+SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
+SCRIPT_PATH="${BASH_SOURCE[0]}"
+AUTO_UPDATE_ENABLED=true  # Mettre à false pour désactiver l'auto-update
+
 CTID=103
 CONTAINER_NAME="nfs-server"
 ZPOOL="zpool1"  # Pool entier à répliquer (tous les datasets)
@@ -34,6 +40,79 @@ log() {
     shift
     logger -t "zfs-nfs-replica" -p "${LOG_FACILITY}.${level}" "$@"
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $@" >&2
+}
+
+# Fonction d'auto-update
+auto_update() {
+    # Vérifier si l'auto-update est activé
+    if [[ "${AUTO_UPDATE_ENABLED}" != "true" ]]; then
+        return 0
+    fi
+
+    # Éviter les boucles infinies en cas de problème
+    if [[ "${SKIP_AUTO_UPDATE:-false}" == "true" ]]; then
+        return 0
+    fi
+
+    log "info" "Vérification des mises à jour depuis ${REPO_URL}..."
+
+    # Télécharger la version distante dans un fichier temporaire
+    local temp_script
+    temp_script=$(mktemp)
+
+    if ! curl -sf -o "$temp_script" "$SCRIPT_URL" 2>/dev/null; then
+        log "warning" "Impossible de vérifier les mises à jour (réseau ou dépôt inaccessible)"
+        rm -f "$temp_script"
+        return 0
+    fi
+
+    # Extraire la version du script distant
+    local remote_version
+    remote_version=$(grep '^SCRIPT_VERSION=' "$temp_script" | head -1 | cut -d'"' -f2)
+
+    if [[ -z "$remote_version" ]]; then
+        log "warning" "Impossible de déterminer la version distante"
+        rm -f "$temp_script"
+        return 0
+    fi
+
+    # Comparer les versions
+    if [[ "$remote_version" == "$SCRIPT_VERSION" ]]; then
+        log "info" "✓ Script à jour (version ${SCRIPT_VERSION})"
+        rm -f "$temp_script"
+        return 0
+    fi
+
+    log "warning" "Nouvelle version disponible: ${remote_version} (actuelle: ${SCRIPT_VERSION})"
+    log "info" "Mise à jour automatique du script..."
+
+    # Sauvegarder l'ancienne version
+    local backup_script="${SCRIPT_PATH}.backup-${SCRIPT_VERSION}"
+    if ! cp "$SCRIPT_PATH" "$backup_script"; then
+        log "error" "Impossible de créer une sauvegarde, abandon de la mise à jour"
+        rm -f "$temp_script"
+        return 1
+    fi
+
+    # Remplacer le script par la nouvelle version
+    if ! cp "$temp_script" "$SCRIPT_PATH"; then
+        log "error" "Échec de la mise à jour, restauration de l'ancienne version"
+        cp "$backup_script" "$SCRIPT_PATH"
+        rm -f "$temp_script" "$backup_script"
+        return 1
+    fi
+
+    # Vérifier les permissions
+    chmod +x "$SCRIPT_PATH"
+    rm -f "$temp_script"
+
+    log "info" "✓ Mise à jour réussie vers la version ${remote_version}"
+    log "info" "  Ancienne version sauvegardée: ${backup_script}"
+    log "info" "  Redémarrage du script avec la nouvelle version..."
+
+    # Relancer le script avec les mêmes arguments
+    export SKIP_AUTO_UPDATE=true
+    exec "$SCRIPT_PATH" "$@"
 }
 
 # Fonction de vérification du statut du LXC
@@ -329,6 +408,9 @@ check_size_safety() {
 LOCAL_NODE=$(hostname)
 log "info" "Démarrage du script sur le nœud: ${LOCAL_NODE}"
 
+# Vérifier les mises à jour (avant toute opération)
+auto_update "$@"
+
 # Déterminer le nœud distant et son IP
 case "$LOCAL_NODE" in
     "acemagician")
@@ -456,17 +538,21 @@ done <<< "$FIRST_LEVEL_DATASETS"
 # Lancer la réplication pour chaque dataset de premier niveau
 # Chaque réplication est récursive, donc elle inclut tous les datasets enfants
 REPLICATION_FAILED=0
+DATASETS_PROCESSED=0
 
 while read -r dataset; do
+    DATASETS_PROCESSED=$((DATASETS_PROCESSED + 1))
     log "info" "=== Réplication de ${dataset} (récursif) ==="
 
-    if syncoid $SYNCOID_OPTS "$dataset" "root@${REMOTE_NODE_IP}:${dataset}"; then
+    if syncoid $SYNCOID_OPTS "$dataset" "root@${REMOTE_NODE_IP}:${dataset}" < /dev/null; then
         log "info" "✓ ${dataset} répliqué avec succès"
     else
         log "error" "✗ Échec de la réplication de ${dataset}"
         REPLICATION_FAILED=1
     fi
 done <<< "$FIRST_LEVEL_DATASETS"
+
+log "info" "Nombre de datasets traités: ${DATASETS_PROCESSED}"
 
 if [[ $REPLICATION_FAILED -eq 0 ]]; then
     log "info" "✓ Réplication récursive réussie vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
