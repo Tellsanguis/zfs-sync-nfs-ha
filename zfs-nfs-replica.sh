@@ -11,13 +11,13 @@
 # - Gère l'activation/désactivation de Sanoid selon le nœud actif
 #
 # Auteur : BENE Maël
-# Version : 1.6.0
+# Version : 1.7.0
 #
 
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="1.6.0"
+SCRIPT_VERSION="1.7.0"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -176,30 +176,59 @@ verify_lxc_is_active() {
     fi
 }
 
-# Gestion de Sanoid selon le nœud actif
-manage_sanoid() {
-    local action="$1"  # "enable" ou "disable"
+# Configuration dynamique de Sanoid selon le rôle
+configure_sanoid() {
+    local role="$1"  # "active" ou "passive"
 
-    if [[ "$action" == "enable" ]]; then
-        # Activer Sanoid sur le nœud actif
+    if [[ "$role" == "active" ]]; then
+        log "info" "Configuration de Sanoid en mode ACTIF (autosnap=yes, autoprune=yes)"
+        cat > /etc/sanoid/sanoid.conf <<'EOF'
+[zpool1]
+    use_template = production
+    recursive = yes
+
+[template_production]
+    hourly = 24
+    daily = 7
+    monthly = 3
+    yearly = 1
+    autosnap = yes
+    autoprune = yes
+EOF
+
         if systemctl is-enabled sanoid.timer &>/dev/null; then
             if ! systemctl is-active sanoid.timer &>/dev/null; then
-                log "info" "Activation de Sanoid sur le nœud actif"
+                log "info" "Demarrage de Sanoid sur le noeud actif"
                 systemctl start sanoid.timer
             fi
         else
-            log "info" "Activation et démarrage de Sanoid sur le nœud actif"
+            log "info" "Activation et demarrage de Sanoid sur le noeud actif"
             systemctl enable --now sanoid.timer
         fi
-    elif [[ "$action" == "disable" ]]; then
-        # Désactiver Sanoid sur le nœud passif
-        if systemctl is-active sanoid.timer &>/dev/null; then
-            log "info" "Désactivation de Sanoid sur le nœud passif"
-            systemctl stop sanoid.timer
-        fi
+    elif [[ "$role" == "passive" ]]; then
+        log "info" "Configuration de Sanoid en mode PASSIF (autosnap=no, autoprune=yes)"
+        cat > /etc/sanoid/sanoid.conf <<'EOF'
+[zpool1]
+    use_template = production
+    recursive = yes
+
+[template_production]
+    hourly = 24
+    daily = 7
+    monthly = 3
+    yearly = 1
+    autosnap = no
+    autoprune = yes
+EOF
+
         if systemctl is-enabled sanoid.timer &>/dev/null; then
-            log "info" "Désactivation permanente de Sanoid sur le nœud passif"
-            systemctl disable sanoid.timer
+            if ! systemctl is-active sanoid.timer &>/dev/null; then
+                log "info" "Demarrage de Sanoid sur le noeud passif"
+                systemctl start sanoid.timer
+            fi
+        else
+            log "info" "Activation et demarrage de Sanoid sur le noeud passif"
+            systemctl enable --now sanoid.timer
         fi
     fi
 }
@@ -432,13 +461,13 @@ log "info" "Nœud distant configuré: ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
 # Triple vérification de sécurité
 if ! verify_lxc_is_active; then
     log "info" "Le LXC ${CTID} n'est pas actif sur ce nœud. Pas de réplication nécessaire."
-    # Désactiver Sanoid sur le nœud passif
-    manage_sanoid "disable"
+    # Configurer Sanoid en mode passif
+    configure_sanoid "passive"
     exit 0
 fi
 
-# Le LXC est actif ici : activer Sanoid sur ce nœud
-manage_sanoid "enable"
+# Le LXC est actif ici : configurer Sanoid en mode actif
+configure_sanoid "active"
 
 # Vérification de l'existence du pool
 if ! zpool list "$ZPOOL" &>/dev/null; then

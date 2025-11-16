@@ -112,7 +112,21 @@ Sanoid crée des snapshots selon un calendrier défini :
 - **Mensuel** : 3 snapshots (rétention de 3 mois)
 - **Annuel** : 1 snapshot (rétention de 1 an)
 
-**Activation intelligente** : Sanoid est automatiquement activé uniquement sur le nœud actif (celui qui héberge le LXC) et désactivé sur le nœud passif, évitant ainsi les conflits de snapshots.
+**Configuration dynamique selon le rôle** (conforme à la [documentation Sanoid](https://github.com/jimsalterjrs/sanoid/wiki/Syncoid#snapshot-management-with-sanoid)) :
+
+Le script configure automatiquement Sanoid différemment selon le rôle du nœud :
+
+**Nœud actif** (héberge le LXC) :
+- `autosnap = yes` : crée les snapshots
+- `autoprune = yes` : supprime les anciens snapshots selon la politique de rétention
+- Sanoid.timer activé
+
+**Nœud passif** (reçoit la réplication) :
+- `autosnap = no` : ne crée pas de snapshots (ils arrivent via syncoid)
+- `autoprune = yes` : supprime les anciens snapshots selon la même politique
+- Sanoid.timer activé
+
+Cette approche garantit que les deux nœuds convergent vers le même ensemble de snapshots, évitant l'accumulation indéfinie sur le nœud passif tout en maintenant la synchronisation.
 
 ### Détection Automatique de Première Synchronisation
 
@@ -150,7 +164,7 @@ Ces protections garantissent qu'un disque vide ne pourra jamais écraser acciden
 - **Mise à jour automatique** : Le script vérifie et installe automatiquement les nouvelles versions depuis le dépôt Forgejo avant chaque exécution
 - **Réplication bidirectionnelle automatique** : S'adapte aux migrations Proxmox HA sans intervention manuelle
 - **Détection automatique première sync/incrémentale** : Bascule automatiquement entre mode initial et mode incrémental
-- **Gestion automatique de Sanoid** : Active/désactive Sanoid selon le nœud actif pour éviter les conflits de snapshots
+- **Configuration dynamique de Sanoid** : Configure automatiquement Sanoid en mode actif ou passif selon le rôle du nœud, conformément aux recommandations de la documentation officielle
 - **Double protection anti-écrasement** : Vérifications de cohérence des tailles et historique pour prévenir toute perte de données
 - **Synchronisation récursive du pool** : Tous les datasets sous `zpool1` sont automatiquement inclus
 - **Contrôle de concurrence par verrou** : Empêche les tâches de réplication simultanées
@@ -164,7 +178,7 @@ Ces protections garantissent qu'un disque vide ne pourra jamais écraser acciden
 ```
 .
 ├── README.md                    # Ce fichier
-├── zfs-nfs-replica.sh           # Script principal de réplication (version 1.6.0)
+├── zfs-nfs-replica.sh           # Script principal de réplication (version 1.7.0)
 ├── zfs-nfs-replica.service      # Définition du service systemd
 └── zfs-nfs-replica.timer        # Configuration du timer systemd
 ```
@@ -245,6 +259,10 @@ ha-manager migrate ct:103 elitedesk
 
 - Cluster Proxmox VE (testé sur 8.x)
 - Pools ZFS nommés `zpool1` sur les nœuds de production
+- **Configuration du mount point LXC pour HA** : Le mount point dans la configuration du LXC doit avoir l'option `shared=1` pour permettre le montage sur différents nœuds lors des migrations
+  ```
+  mp0: /zpool1/data-nfs-share,mp=/data-nfs-share,shared=1
+  ```
 - Sanoid/Syncoid installés depuis le dépôt officiel Sanoid
 - Paire de clés SSH dédiée pour la réplication
 - Conteneur LXC avec rootfs sur LINSTOR/DRBD
