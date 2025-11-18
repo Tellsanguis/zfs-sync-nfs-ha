@@ -1,23 +1,26 @@
 #!/bin/bash
 #
-# Script de réplication ZFS automatique pour NFS HA
+# Script de réplication ZFS automatique pour NFS HA (Multi-pools)
 # À déployer sur acemagician et elitedesk
 #
-# Ce script :
+# Ce script version 2.0 :
+# - Supporte la réplication de plusieurs pools ZFS simultanément
 # - Vérifie 3 fois que le LXC nfs-server est actif localement
 # - Détermine le nœud distant automatiquement
-# - Réplique le dataset ZFS vers le nœud passif
-# - Utilise un verrou pour éviter les réplications concurrentes
+# - Réplique chaque pool ZFS vers le nœud passif avec isolation des erreurs
+# - Utilise un verrou par pool pour éviter les réplications concurrentes
 # - Gère l'activation/désactivation de Sanoid selon le nœud actif
+# - Logs avec rotation automatique (2 semaines de rétention)
+# - Fichiers d'état séparés par pool
 #
 # Auteur : BENE Maël
-# Version : 1.7.0
+# Version : 2.0.0
 #
 
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="1.7.0"
+SCRIPT_VERSION="2.0.0"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -25,21 +28,63 @@ AUTO_UPDATE_ENABLED=true  # Mettre à false pour désactiver l'auto-update
 
 CTID=103
 CONTAINER_NAME="nfs-server"
-ZPOOL="zpool1"  # Pool entier à répliquer (tous les datasets)
+
+# Support multi-pools - Liste des pools à répliquer
+# Ajouter ou retirer des pools selon vos besoins
+ZPOOLS=("zpool1" "zpool2")
+
 CHECK_DELAY=2  # Délai entre chaque vérification (secondes)
 LOG_FACILITY="local0"
 SSH_KEY="/root/.ssh/id_ed25519_zfs_replication"
 STATE_DIR="/var/lib/zfs-nfs-replica"
-SIZES_FILE="${STATE_DIR}/last-sync-sizes.txt"
 SIZE_TOLERANCE=20  # Tolérance de variation en pourcentage (±20%)
 MIN_REMOTE_RATIO=50  # Le distant doit avoir au moins 50% de la taille du local
 
-# Fonction de logging
+# Configuration des logs (rotation 2 semaines)
+LOG_DIR="/var/log/zfs-nfs-replica"
+LOG_RETENTION_DAYS=14
+
+# Initialiser le répertoire de logs
+init_logging() {
+    mkdir -p "$LOG_DIR"
+
+    # Créer une configuration logrotate si elle n'existe pas
+    local logrotate_conf="/etc/logrotate.d/zfs-nfs-replica"
+    if [[ ! -f "$logrotate_conf" ]]; then
+        cat > "$logrotate_conf" <<EOF
+${LOG_DIR}/*.log {
+    daily
+    rotate ${LOG_RETENTION_DAYS}
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0640 root root
+}
+EOF
+    fi
+}
+
+# Fonction de logging améliorée
 log() {
     local level="$1"
     shift
-    logger -t "zfs-nfs-replica" -p "${LOG_FACILITY}.${level}" "$@"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [$level] $@" >&2
+    local pool="${CURRENT_POOL:-global}"
+    local timestamp="$(date '+%Y-%m-%d %H:%M:%S')"
+    local message="[$timestamp] [$level] [$pool] $@"
+
+    # Log vers syslog
+    logger -t "zfs-nfs-replica" -p "${LOG_FACILITY}.${level}" "[$pool] $@"
+
+    # Log vers stderr
+    echo "$message" >&2
+
+    # Log vers fichier (si pool spécifié)
+    if [[ "$pool" != "global" ]]; then
+        echo "$message" >> "${LOG_DIR}/${pool}.log"
+    else
+        echo "$message" >> "${LOG_DIR}/general.log"
+    fi
 }
 
 # Fonction d'auto-update
@@ -179,57 +224,53 @@ verify_lxc_is_active() {
 # Configuration dynamique de Sanoid selon le rôle
 configure_sanoid() {
     local role="$1"  # "active" ou "passive"
+    local autosnap_value="yes"
 
-    if [[ "$role" == "active" ]]; then
-        log "info" "Configuration de Sanoid en mode ACTIF (autosnap=yes, autoprune=yes)"
-        cat > /etc/sanoid/sanoid.conf <<'EOF'
-[zpool1]
-    use_template = production
-    recursive = yes
-
-[template_production]
-    hourly = 24
-    daily = 7
-    monthly = 3
-    yearly = 1
-    autosnap = yes
-    autoprune = yes
-EOF
-
-        if systemctl is-enabled sanoid.timer &>/dev/null; then
-            if ! systemctl is-active sanoid.timer &>/dev/null; then
-                log "info" "Demarrage de Sanoid sur le noeud actif"
-                systemctl start sanoid.timer
-            fi
-        else
-            log "info" "Activation et demarrage de Sanoid sur le noeud actif"
-            systemctl enable --now sanoid.timer
-        fi
-    elif [[ "$role" == "passive" ]]; then
+    if [[ "$role" == "passive" ]]; then
+        autosnap_value="no"
         log "info" "Configuration de Sanoid en mode PASSIF (autosnap=no, autoprune=yes)"
-        cat > /etc/sanoid/sanoid.conf <<'EOF'
-[zpool1]
+    else
+        log "info" "Configuration de Sanoid en mode ACTIF (autosnap=yes, autoprune=yes)"
+    fi
+
+    # Générer la configuration pour tous les pools
+    cat > /etc/sanoid/sanoid.conf <<EOF
+# Configuration automatique - Ne pas éditer manuellement
+# Généré par zfs-nfs-replica.sh version ${SCRIPT_VERSION}
+# Mode: ${role}
+
+EOF
+
+    # Ajouter chaque pool à la configuration
+    for pool in "${ZPOOLS[@]}"; do
+        cat >> /etc/sanoid/sanoid.conf <<EOF
+[${pool}]
     use_template = production
     recursive = yes
 
+EOF
+    done
+
+    # Ajouter le template
+    cat >> /etc/sanoid/sanoid.conf <<EOF
 [template_production]
     hourly = 24
     daily = 7
     monthly = 3
     yearly = 1
-    autosnap = no
+    autosnap = ${autosnap_value}
     autoprune = yes
 EOF
 
-        if systemctl is-enabled sanoid.timer &>/dev/null; then
-            if ! systemctl is-active sanoid.timer &>/dev/null; then
-                log "info" "Demarrage de Sanoid sur le noeud passif"
-                systemctl start sanoid.timer
-            fi
-        else
-            log "info" "Activation et demarrage de Sanoid sur le noeud passif"
-            systemctl enable --now sanoid.timer
+    # Activer et démarrer Sanoid si nécessaire
+    if systemctl is-enabled sanoid.timer &>/dev/null; then
+        if ! systemctl is-active sanoid.timer &>/dev/null; then
+            log "info" "Demarrage de Sanoid sur le noeud ${role}"
+            systemctl start sanoid.timer
         fi
+    else
+        log "info" "Activation et demarrage de Sanoid sur le noeud ${role}"
+        systemctl enable --now sanoid.timer
     fi
 }
 
@@ -291,8 +332,9 @@ get_dataset_sizes() {
 # Sauvegarde des tailles de datasets après sync réussie
 save_dataset_sizes() {
     local pool="$1"
+    local sizes_file="${STATE_DIR}/last-sync-sizes-${pool}.txt"
 
-    log "info" "Sauvegarde des tailles de datasets dans ${SIZES_FILE}"
+    log "info" "Sauvegarde des tailles de datasets dans ${sizes_file}"
 
     # Créer le répertoire si nécessaire
     mkdir -p "$STATE_DIR"
@@ -301,7 +343,7 @@ save_dataset_sizes() {
     {
         echo "timestamp=$(date '+%Y-%m-%d_%H:%M:%S')"
         get_dataset_sizes "local" "$pool" | awk '{print $1"="$2}'
-    } > "$SIZES_FILE"
+    } > "$sizes_file"
 
     log "info" "✓ Tailles sauvegardées"
 }
@@ -310,6 +352,7 @@ save_dataset_sizes() {
 check_size_safety() {
     local remote_ip="$1"
     local pool="$2"
+    local sizes_file="${STATE_DIR}/last-sync-sizes-${pool}.txt"
 
     log "info" "=== Vérifications de sécurité avant --force-delete ==="
 
@@ -327,7 +370,7 @@ check_size_safety() {
 
     # Vérifier si un historique existe (indique que ce nœud a déjà été actif)
     local has_history=false
-    if [[ -f "$SIZES_FILE" ]]; then
+    if [[ -f "$sizes_file" ]]; then
         has_history=true
     fi
 
@@ -397,13 +440,13 @@ check_size_safety() {
         log "info" "Vérification #2: Comparaison avec l'historique des tailles"
 
         local previous_timestamp
-        previous_timestamp=$(grep "^timestamp=" "$SIZES_FILE" | cut -d= -f2)
+        previous_timestamp=$(grep "^timestamp=" "$sizes_file" | cut -d= -f2)
         log "info" "Dernière synchronisation réussie: ${previous_timestamp}"
 
         local dataset size_remote size_previous diff_percent
         while IFS=$'\t' read -r dataset size_remote; do
             # Récupérer la taille précédente
-            size_previous=$(grep "^${dataset}=" "$SIZES_FILE" | cut -d= -f2)
+            size_previous=$(grep "^${dataset}=" "$sizes_file" | cut -d= -f2)
 
             if [[ -n "$size_previous" ]] && [[ "$size_previous" -gt 0 ]]; then
                 # Calculer la différence en pourcentage
@@ -433,9 +476,138 @@ check_size_safety() {
     return 0
 }
 
+# Fonction de réplication d'un pool
+replicate_pool() {
+    local pool="$1"
+    local remote_ip="$2"
+    local remote_name="$3"
+
+    export CURRENT_POOL="$pool"
+    log "info" "=========================================="
+    log "info" "Début de la réplication du pool: ${pool}"
+    log "info" "=========================================="
+
+    # Vérification de l'existence du pool
+    if ! zpool list "$pool" &>/dev/null; then
+        log "error" "Le pool ${pool} n'existe pas sur ce nœud - IGNORÉ"
+        return 1
+    fi
+
+    # Verrou pour éviter les réplications concurrentes de ce pool
+    local lockfile="/var/run/zfs-replica-${pool}.lock"
+    local lockfd=201
+
+    # Tentative d'acquisition du verrou (non-bloquant)
+    eval "exec ${lockfd}>${lockfile}"
+    if ! flock -n ${lockfd}; then
+        log "info" "Une réplication de ${pool} est déjà en cours - IGNORÉ"
+        return 0
+    fi
+
+    log "info" "Verrou acquis pour ${pool}"
+
+    # Vérification que le pool existe sur le nœud distant
+    if ! ssh -i "$SSH_KEY" "root@${remote_ip}" "zpool list ${pool}" &>/dev/null; then
+        log "error" "Le pool ${pool} n'existe pas sur ${remote_name}"
+        flock -u ${lockfd}
+        return 1
+    fi
+
+    # Vérification des snapshots en commun et choix de la stratégie
+    log "info" "Début de la réplication récursive: ${pool} → ${remote_name} (${remote_ip}):${pool}"
+
+    # Syncoid utilise les options SSH via la variable d'environnement SSH
+    export SSH="ssh -i ${SSH_KEY}"
+
+    local syncoid_opts
+    # Déterminer si c'est une première synchronisation
+    if check_common_snapshots "$remote_ip" "$pool"; then
+        # Snapshots en commun : réplication incrémentale normale
+        log "info" "Mode: Réplication incrémentale (snapshots en commun détectés)"
+        syncoid_opts="--recursive --no-sync-snap"
+    else
+        # Pas de snapshots en commun : première synchronisation avec --force-delete
+        log "warning" "Mode: Première synchronisation détectée"
+        log "warning" "Utilisation de --force-delete pour écraser les datasets incompatibles"
+
+        # SÉCURITÉ : Vérifier les tailles avant d'autoriser --force-delete
+        if ! check_size_safety "$remote_ip" "$pool"; then
+            log "error" "╔════════════════════════════════════════════════════════════════╗"
+            log "error" "║ ARRÊT DE SÉCURITÉ pour ${pool}                                ║"
+            log "error" "║ Les vérifications de sécurité ont échoué.                     ║"
+            log "error" "║ --force-delete REFUSÉ pour éviter une perte de données.       ║"
+            log "error" "╚════════════════════════════════════════════════════════════════╝"
+            flock -u ${lockfd}
+            return 1
+        fi
+
+        syncoid_opts="--recursive --force-delete"
+    fi
+
+    # Lister les datasets de premier niveau sous le pool
+    local first_level_datasets
+    first_level_datasets=$(zfs list -H -o name -r "$pool" -t filesystem,volume -d 1 | grep -v "^${pool}$")
+
+    if [[ -z "$first_level_datasets" ]]; then
+        log "error" "Aucun dataset trouvé sous ${pool}"
+        flock -u ${lockfd}
+        return 1
+    fi
+
+    log "info" "Datasets à répliquer:"
+    while read -r dataset; do
+        log "info" "  - ${dataset}"
+    done <<< "$first_level_datasets"
+
+    # Lancer la réplication pour chaque dataset de premier niveau
+    local replication_failed=0
+    local datasets_processed=0
+
+    while read -r dataset; do
+        datasets_processed=$((datasets_processed + 1))
+        log "info" "=== Réplication de ${dataset} (récursif) ==="
+
+        if syncoid $syncoid_opts "$dataset" "root@${remote_ip}:${dataset}" < /dev/null; then
+            log "info" "✓ ${dataset} répliqué avec succès"
+        else
+            log "error" "✗ Échec de la réplication de ${dataset}"
+            replication_failed=1
+        fi
+    done <<< "$first_level_datasets"
+
+    log "info" "Nombre de datasets traités: ${datasets_processed}"
+
+    # Libérer le verrou
+    flock -u ${lockfd}
+
+    if [[ $replication_failed -eq 0 ]]; then
+        log "info" "✓ Réplication récursive réussie vers ${remote_name} (${remote_ip})"
+        log "info" "  Tous les datasets de ${pool} ont été synchronisés"
+
+        # Sauvegarder les tailles après sync réussie
+        save_dataset_sizes "$pool"
+
+        return 0
+    else
+        log "error" "✗ Échec de la réplication de ${pool} vers ${remote_name} (${remote_ip})"
+        return 1
+    fi
+}
+
+################################################################################
+# SCRIPT PRINCIPAL
+################################################################################
+
+# Initialiser le système de logs
+init_logging
+
 # Détermination du nœud local et distant
 LOCAL_NODE=$(hostname)
-log "info" "Démarrage du script sur le nœud: ${LOCAL_NODE}"
+export CURRENT_POOL="global"
+log "info" "=========================================="
+log "info" "Démarrage du script version ${SCRIPT_VERSION}"
+log "info" "Nœud: ${LOCAL_NODE}"
+log "info" "=========================================="
 
 # Vérifier les mises à jour (avant toute opération)
 auto_update "$@"
@@ -457,6 +629,7 @@ case "$LOCAL_NODE" in
 esac
 
 log "info" "Nœud distant configuré: ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
+log "info" "Pools configurés: ${ZPOOLS[*]}"
 
 # Triple vérification de sécurité
 if ! verify_lxc_is_active; then
@@ -469,35 +642,6 @@ fi
 # Le LXC est actif ici : configurer Sanoid en mode actif
 configure_sanoid "active"
 
-# Vérification de l'existence du pool
-if ! zpool list "$ZPOOL" &>/dev/null; then
-    log "error" "Le pool ${ZPOOL} n'existe pas sur ce nœud"
-    exit 1
-fi
-
-# Verrou pour éviter les réplications concurrentes
-LOCKFILE="/var/run/zfs-replica-${ZPOOL}.lock"
-LOCKFD=200
-
-# Fonction de nettoyage
-cleanup() {
-    if [[ -n "${LOCK_ACQUIRED:-}" ]]; then
-        log "info" "Libération du verrou"
-        flock -u $LOCKFD
-    fi
-}
-trap cleanup EXIT
-
-# Tentative d'acquisition du verrou (non-bloquant)
-eval "exec $LOCKFD>$LOCKFILE"
-if ! flock -n $LOCKFD; then
-    log "info" "Une réplication est déjà en cours. Abandon."
-    exit 0
-fi
-LOCK_ACQUIRED=1
-
-log "info" "Verrou acquis. Début de la réplication."
-
 # Vérification de la connectivité SSH vers le nœud distant
 if ! ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o BatchMode=yes "root@${REMOTE_NODE_IP}" "echo OK" &>/dev/null; then
     log "error" "Impossible de se connecter à ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP}) via SSH"
@@ -506,92 +650,39 @@ fi
 
 log "info" "Connexion SSH vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP}) vérifiée"
 
-# Vérification que le pool existe sur le nœud distant
-if ! ssh -i "$SSH_KEY" "root@${REMOTE_NODE_IP}" "zpool list ${ZPOOL}" &>/dev/null; then
-    log "error" "Le pool ${ZPOOL} n'existe pas sur ${REMOTE_NODE_NAME}"
-    exit 1
-fi
+# Compteurs globaux
+POOLS_TOTAL=${#ZPOOLS[@]}
+POOLS_SUCCESS=0
+POOLS_FAILED=0
+POOLS_SKIPPED=0
 
-# Vérification des snapshots en commun et choix de la stratégie de réplication
-log "info" "Début de la réplication récursive: ${ZPOOL} → ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP}):${ZPOOL}"
+log "info" "=========================================="
+log "info" "Début de la réplication de ${POOLS_TOTAL} pool(s)"
+log "info" "=========================================="
 
-# Syncoid utilise les options SSH via la variable d'environnement SSH
-export SSH="ssh -i ${SSH_KEY}"
-
-# Déterminer si c'est une première synchronisation
-if check_common_snapshots "$REMOTE_NODE_IP" "$ZPOOL"; then
-    # Snapshots en commun : réplication incrémentale normale
-    log "info" "Mode: Réplication incrémentale (snapshots en commun détectés)"
-    SYNCOID_OPTS="--recursive --no-sync-snap"
-else
-    # Pas de snapshots en commun : première synchronisation avec --force-delete
-    log "warning" "Mode: Première synchronisation détectée"
-    log "warning" "Utilisation de --force-delete pour écraser les datasets incompatibles"
-
-    # SÉCURITÉ : Vérifier les tailles avant d'autoriser --force-delete
-    if ! check_size_safety "$REMOTE_NODE_IP" "$ZPOOL"; then
-        log "error" "╔════════════════════════════════════════════════════════════════╗"
-        log "error" "║ ARRÊT DE SÉCURITÉ                                              ║"
-        log "error" "║ Les vérifications de sécurité ont échoué.                     ║"
-        log "error" "║ --force-delete REFUSÉ pour éviter une perte de données.       ║"
-        log "error" "║                                                                ║"
-        log "error" "║ Actions possibles :                                            ║"
-        log "error" "║ 1. Vérifier manuellement les tailles des datasets             ║"
-        log "error" "║ 2. Si changement de disque : supprimer ${SIZES_FILE}          ║"
-        log "error" "║ 3. Vérifier que le bon nœud est actif (LXC sur le bon nœud)   ║"
-        log "error" "╚════════════════════════════════════════════════════════════════╝"
-        exit 1
-    fi
-
-    log "info" "Note: Première synchronisation - syncoid va créer un snapshot initial"
-    log "info" "      Les blocs de données existants seront réutilisés (pas de transfert complet)"
-    # Pour la première sync: pas de --no-sync-snap (on veut que syncoid crée un snapshot)
-    # mais on garde --force-delete pour écraser les datasets vides/incompatibles
-    SYNCOID_OPTS="--recursive --force-delete"
-fi
-
-# Lister les datasets de premier niveau sous le pool
-# (on ne réplique pas le pool racine lui-même, seulement ses enfants directs)
-FIRST_LEVEL_DATASETS=$(zfs list -H -o name -r "$ZPOOL" -t filesystem,volume -d 1 | grep -v "^${ZPOOL}$")
-
-if [[ -z "$FIRST_LEVEL_DATASETS" ]]; then
-    log "error" "Aucun dataset trouvé sous ${ZPOOL}"
-    exit 1
-fi
-
-log "info" "Datasets à répliquer:"
-while read -r dataset; do
-    log "info" "  - ${dataset}"
-done <<< "$FIRST_LEVEL_DATASETS"
-
-# Lancer la réplication pour chaque dataset de premier niveau
-# Chaque réplication est récursive, donc elle inclut tous les datasets enfants
-REPLICATION_FAILED=0
-DATASETS_PROCESSED=0
-
-while read -r dataset; do
-    DATASETS_PROCESSED=$((DATASETS_PROCESSED + 1))
-    log "info" "=== Réplication de ${dataset} (récursif) ==="
-
-    if syncoid $SYNCOID_OPTS "$dataset" "root@${REMOTE_NODE_IP}:${dataset}" < /dev/null; then
-        log "info" "✓ ${dataset} répliqué avec succès"
+# Réplication de chaque pool
+for pool in "${ZPOOLS[@]}"; do
+    if replicate_pool "$pool" "$REMOTE_NODE_IP" "$REMOTE_NODE_NAME"; then
+        POOLS_SUCCESS=$((POOLS_SUCCESS + 1))
     else
-        log "error" "✗ Échec de la réplication de ${dataset}"
-        REPLICATION_FAILED=1
+        POOLS_FAILED=$((POOLS_FAILED + 1))
     fi
-done <<< "$FIRST_LEVEL_DATASETS"
+done
 
-log "info" "Nombre de datasets traités: ${DATASETS_PROCESSED}"
+# Résumé final
+export CURRENT_POOL="global"
+log "info" "=========================================="
+log "info" "RÉSUMÉ DE LA RÉPLICATION"
+log "info" "=========================================="
+log "info" "Pools traités: ${POOLS_TOTAL}"
+log "info" "  ✓ Succès: ${POOLS_SUCCESS}"
+log "info" "  ✗ Échecs: ${POOLS_FAILED}"
+log "info" "=========================================="
 
-if [[ $REPLICATION_FAILED -eq 0 ]]; then
-    log "info" "✓ Réplication récursive réussie vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
-    log "info" "  Tous les datasets de ${ZPOOL} ont été synchronisés"
-
-    # Sauvegarder les tailles après sync réussie
-    save_dataset_sizes "$ZPOOL"
-
+if [[ $POOLS_FAILED -eq 0 ]]; then
+    log "info" "✓ Toutes les réplications ont réussi"
     exit 0
 else
-    log "error" "✗ Échec de la réplication vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
+    log "error" "✗ ${POOLS_FAILED} pool(s) ont échoué"
     exit 1
 fi
