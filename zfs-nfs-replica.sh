@@ -14,13 +14,13 @@
 # - Fichiers d'état séparés par pool
 #
 # Auteur : BENE Maël
-# Version : 2.0.0
+# Version : 2.0.1
 #
 
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="2.0.0"
+SCRIPT_VERSION="2.0.1"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -254,10 +254,12 @@ EOF
     # Ajouter le template
     cat >> /etc/sanoid/sanoid.conf <<EOF
 [template_production]
-    hourly = 24
+    frequently = 48
+    frequent_period = 15
+    hourly = 48
     daily = 7
-    monthly = 3
-    yearly = 1
+    monthly = 0
+    yearly = 0
     autosnap = ${autosnap_value}
     autoprune = yes
 EOF
