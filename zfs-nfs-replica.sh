@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="2.1.0"
+SCRIPT_VERSION="2.2.0"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -1297,6 +1297,23 @@ log "info" "Pools configurés: ${ZPOOLS[*]}"
 # Triple vérification de sécurité
 if ! verify_lxc_is_active; then
     log "info" "Le LXC ${CTID} n'est pas actif sur ce nœud. Pas de réplication nécessaire."
+
+    # Vérification de santé des pools sur nœud passif
+    log "info" "Vérification de santé des pools (nœud passif)"
+    PASSIVE_HEALTH_FAILED=false
+    for pool in "${ZPOOLS[@]}"; do
+        if ! verify_pool_health "$pool"; then
+            log "warning" "⚠ Pool ${pool} en mauvaise santé sur nœud PASSIF"
+            send_notification "error" "Pool dégradé sur nœud passif" \
+                "Pool: ${pool}\nNœud: ${LOCAL_NODE}\nStatut: PASSIF\n\nLe pool est dégradé mais ce nœud est passif. Vérifier l'état du matériel avant un éventuel failover."
+            PASSIVE_HEALTH_FAILED=true
+        fi
+    done
+
+    if [[ "$PASSIVE_HEALTH_FAILED" == "false" ]]; then
+        log "info" "✓ Tous les pools sont en bonne santé (nœud passif)"
+    fi
+
     # Configurer Sanoid en mode passif
     configure_sanoid "passive"
     exit 0
