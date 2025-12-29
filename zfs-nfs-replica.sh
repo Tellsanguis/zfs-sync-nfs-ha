@@ -3,24 +3,28 @@
 # Script de réplication ZFS automatique pour NFS HA (Multi-pools)
 # À déployer sur acemagician et elitedesk
 #
-# Ce script version 2.0 :
+# Ce script version 2.1 :
 # - Supporte la réplication de plusieurs pools ZFS simultanément
 # - Vérifie 3 fois que le LXC nfs-server est actif localement
+# - Vérifie l'état de santé des disques et pools ZFS avant réplication
+# - Détecte les disques manquants, pools dégradés, erreurs I/O
+# - Migration automatique du LXC en cas de défaillance matérielle
+# - Protection anti-ping-pong (arrêt du LXC si erreur < 1h)
 # - Détermine le nœud distant automatiquement
 # - Réplique chaque pool ZFS vers le nœud passif avec isolation des erreurs
 # - Utilise un verrou par pool pour éviter les réplications concurrentes
 # - Gère l'activation/désactivation de Sanoid selon le nœud actif
 # - Logs avec rotation automatique (2 semaines de rétention)
-# - Fichiers d'état séparés par pool
+# - Fichiers d'état séparés par pool (tailles, UUIDs disques, erreurs critiques)
 #
 # Auteur : BENE Maël
-# Version : 2.0.1
+# Version : 2.1.0
 #
 
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="2.0.1"
+SCRIPT_VERSION="2.1.0"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -43,6 +47,10 @@ MIN_REMOTE_RATIO=50  # Le distant doit avoir au moins 50% de la taille du local
 # Configuration des logs (rotation 2 semaines)
 LOG_DIR="/var/log/zfs-nfs-replica"
 LOG_RETENTION_DAYS=14
+
+# Configuration de vérification de santé des pools
+HEALTH_CHECK_MIN_FREE_SPACE=5  # Pourcentage minimum d'espace libre
+HEALTH_CHECK_ERROR_COOLDOWN=3600  # Anti-ping-pong: 1 heure en secondes
 
 # Initialiser le répertoire de logs
 init_logging() {
@@ -318,6 +326,238 @@ check_common_snapshots() {
     fi
 }
 
+# Extraction des UUIDs des disques physiques d'un pool
+get_pool_disk_uuids() {
+    local pool="$1"
+
+    # Obtenir la configuration du pool avec chemins physiques
+    local pool_config
+    pool_config=$(zpool status -P "$pool" 2>/dev/null)
+
+    if [[ -z "$pool_config" ]]; then
+        return 1
+    fi
+
+    # Extraire les devices physiques (lignes contenant /dev/)
+    # Format typique: "  /dev/sdb1  ONLINE  0  0  0"
+    local devices
+    devices=$(echo "$pool_config" | grep -E '^\s+/dev/' | awk '{print $1}')
+
+    if [[ -z "$devices" ]]; then
+        # Pool virtuel ou pas de disques physiques
+        return 0
+    fi
+
+    # Pour chaque device, résoudre vers /dev/disk/by-id/
+    local uuids=()
+    while read -r device; do
+        if [[ -z "$device" ]]; then
+            continue
+        fi
+
+        # Résoudre le device vers ses liens dans /dev/disk/by-id/
+        local device_id
+        device_id=$(find /dev/disk/by-id/ -type l -exec readlink -f {} \; 2>/dev/null | \
+                    grep -F "$(readlink -f "$device" 2>/dev/null)" | \
+                    head -1)
+
+        if [[ -n "$device_id" ]]; then
+            # Extraire juste le nom du fichier (wwn-*, ata-*, etc.)
+            local uuid_name
+            uuid_name=$(basename "$device_id")
+
+            # Filtrer pour ne garder que les identifiants persistants
+            if [[ "$uuid_name" =~ ^(wwn-|ata-|scsi-|nvme-) ]]; then
+                uuids+=("$uuid_name")
+            fi
+        fi
+    done <<< "$devices"
+
+    # Retourner les UUIDs triés et uniques
+    if [[ ${#uuids[@]} -gt 0 ]]; then
+        printf '%s\n' "${uuids[@]}" | sort -u
+        return 0
+    else
+        # Aucun UUID trouvé (pool virtuel possible)
+        return 0
+    fi
+}
+
+# Initialisation du tracking des disques pour un pool
+init_disk_tracking() {
+    local pool="$1"
+    local uuids_file="${STATE_DIR}/disk-uuids-${pool}.txt"
+
+    # Vérifier si déjà initialisé
+    if [[ -f "$uuids_file" ]] && grep -q "^initialized=true" "$uuids_file" 2>/dev/null; then
+        log "info" "Tracking des disques déjà initialisé pour ${pool}"
+        return 0
+    fi
+
+    log "info" "Initialisation du tracking des disques pour ${pool}"
+
+    # Créer le répertoire d'état si nécessaire
+    mkdir -p "$STATE_DIR"
+
+    # Obtenir les UUIDs des disques du pool
+    local uuids
+    uuids=$(get_pool_disk_uuids "$pool")
+
+    if [[ -z "$uuids" ]]; then
+        log "warning" "Aucun disque physique détecté pour ${pool} (pool virtuel?)"
+        # Créer quand même un fichier pour marquer comme initialisé
+        cat > "$uuids_file" <<EOF
+initialized=true
+timestamp=$(date '+%Y-%m-%d_%H:%M:%S')
+hostname=$(hostname)
+pool=${pool}
+vdev_type=virtual
+# Aucun disque physique détecté
+EOF
+        chmod 600 "$uuids_file"
+        chown root:root "$uuids_file" 2>/dev/null
+        return 0
+    fi
+
+    # Créer le fichier de tracking
+    cat > "$uuids_file" <<EOF
+initialized=true
+timestamp=$(date '+%Y-%m-%d_%H:%M:%S')
+hostname=$(hostname)
+pool=${pool}
+# Physical disk UUIDs
+EOF
+
+    # Ajouter chaque UUID
+    while read -r uuid; do
+        echo "$uuid" >> "$uuids_file"
+        log "info" "Disque détecté pour ${pool}: ${uuid}"
+    done <<< "$uuids"
+
+    # Définir les permissions
+    chmod 600 "$uuids_file"
+    chown root:root "$uuids_file" 2>/dev/null
+
+    local disk_count
+    disk_count=$(echo "$uuids" | wc -l)
+    log "info" "✓ Tracking des disques initialisé pour ${pool}: ${disk_count} disque(s) enregistré(s)"
+
+    return 0
+}
+
+# Vérification de la présence des disques trackés
+verify_disk_presence() {
+    local pool="$1"
+    local uuids_file="${STATE_DIR}/disk-uuids-${pool}.txt"
+
+    if [[ ! -f "$uuids_file" ]]; then
+        log "error" "Fichier de tracking des disques non trouvé: ${uuids_file}"
+        return 1
+    fi
+
+    # Lire les UUIDs du fichier (ignorer les lignes de commentaires et metadata)
+    local tracked_uuids
+    tracked_uuids=$(grep -E '^(wwn-|ata-|scsi-|nvme-)' "$uuids_file" 2>/dev/null)
+
+    if [[ -z "$tracked_uuids" ]]; then
+        # Pool virtuel, pas de vérification nécessaire
+        log "info" "Pool ${pool}: aucun disque physique à vérifier (pool virtuel)"
+        return 0
+    fi
+
+    # Vérifier chaque UUID
+    local missing_disks=0
+    while read -r uuid; do
+        local disk_path="/dev/disk/by-id/${uuid}"
+
+        if [[ ! -L "$disk_path" ]]; then
+            log "error" "Disque manquant pour ${pool}: ${uuid}"
+            log "error" "  Emplacement attendu: ${disk_path}"
+            missing_disks=$((missing_disks + 1))
+        elif [[ ! -e "$disk_path" ]]; then
+            log "error" "Symlink dangling pour ${pool}: ${uuid}"
+            log "error" "  Le lien existe mais pointe vers un device inexistant"
+            missing_disks=$((missing_disks + 1))
+        fi
+    done <<< "$tracked_uuids"
+
+    if [[ $missing_disks -gt 0 ]]; then
+        log "error" "✗ ${missing_disks} disque(s) manquant(s) pour ${pool}"
+        return 1
+    else
+        log "info" "✓ Tous les disques présents pour ${pool}"
+        return 0
+    fi
+}
+
+# Vérification de l'état de santé du pool ZFS
+check_pool_health_status() {
+    local pool="$1"
+    local health_issues=0
+
+    # Check 1: Status du pool (ONLINE/DEGRADED/FAULTED)
+    local pool_health
+    pool_health=$(zpool list -H -o health "$pool" 2>/dev/null)
+
+    if [[ -z "$pool_health" ]]; then
+        log "error" "Impossible de récupérer le status du pool ${pool}"
+        return 1
+    fi
+
+    if [[ "$pool_health" != "ONLINE" ]]; then
+        log "error" "Pool ${pool} en état dégradé: ${pool_health}"
+        health_issues=$((health_issues + 1))
+    else
+        log "info" "✓ Pool ${pool} status: ONLINE"
+    fi
+
+    # Check 2: Espace libre (doit être > HEALTH_CHECK_MIN_FREE_SPACE%)
+    local capacity
+    capacity=$(zpool list -H -o capacity "$pool" 2>/dev/null | sed 's/%//')
+
+    if [[ -n "$capacity" ]]; then
+        local min_capacity=$((100 - HEALTH_CHECK_MIN_FREE_SPACE))
+
+        if [[ $capacity -ge $min_capacity ]]; then
+            log "error" "Espace disque critique pour ${pool}: ${capacity}% utilisé (seuil: ${min_capacity}%)"
+            health_issues=$((health_issues + 1))
+        else
+            local free_percent=$((100 - capacity))
+            log "info" "✓ Espace libre pour ${pool}: ${free_percent}% (seuil minimum: ${HEALTH_CHECK_MIN_FREE_SPACE}%)"
+        fi
+    fi
+
+    # Check 3: Scrub/resilver en cours (non bloquant, juste informatif)
+    if zpool status "$pool" 2>/dev/null | grep -qi "scrub in progress"; then
+        log "warning" "Scrub en cours sur ${pool} (non bloquant)"
+    fi
+
+    if zpool status "$pool" 2>/dev/null | grep -qi "resilver in progress"; then
+        log "warning" "Resilver en cours sur ${pool} (non bloquant)"
+    fi
+
+    # Check 4: Erreurs I/O (READ/WRITE/CKSUM)
+    local error_lines
+    error_lines=$(zpool status "$pool" 2>/dev/null | grep -E "errors:" | grep -v "No known data errors")
+
+    if [[ -n "$error_lines" ]]; then
+        log "error" "Erreurs détectées sur le pool ${pool}:"
+        zpool status "$pool" 2>/dev/null | grep -E "(READ|WRITE|CKSUM)" | while read -r line; do
+            log "error" "  ${line}"
+        done
+        health_issues=$((health_issues + 1))
+    else
+        log "info" "✓ Aucune erreur I/O détectée sur ${pool}"
+    fi
+
+    if [[ $health_issues -eq 0 ]]; then
+        return 0
+    else
+        log "error" "✗ ${health_issues} problème(s) de santé détecté(s) sur ${pool}"
+        return 1
+    fi
+}
+
 # Récupération des tailles de datasets
 get_dataset_sizes() {
     local target="$1"  # "local" ou "remote:IP"
@@ -475,6 +715,209 @@ check_size_safety() {
 
     log "info" "=== ✓ Toutes les vérifications de sécurité sont passées ==="
     log "info" "=== Autorisation de --force-delete accordée ==="
+    return 0
+}
+
+# Triple vérification de santé (mirroring verify_lxc_is_active pattern)
+triple_health_check() {
+    local pool="$1"
+    local success_count=0
+
+    for i in 1 2 3; do
+        log "info" "Vérification santé #${i}/3 pour ${pool}"
+
+        # Vérifier à la fois la présence des disques ET l'état du pool
+        if verify_disk_presence "$pool" && check_pool_health_status "$pool"; then
+            success_count=$((success_count + 1))
+            log "info" "Vérification santé #${i}/3 réussie pour ${pool}"
+        else
+            log "error" "Vérification santé #${i}/3 échouée pour ${pool}"
+            # Ne pas continuer si une vérification échoue
+            return 1
+        fi
+
+        # Délai entre les vérifications (sauf après la dernière)
+        if [[ $i -lt 3 ]]; then
+            sleep "$CHECK_DELAY"
+        fi
+    done
+
+    if [[ $success_count -eq 3 ]]; then
+        log "info" "✓ Triple vérification santé réussie pour ${pool} (${success_count}/3)"
+        return 0
+    else
+        log "error" "✗ Triple vérification santé échouée pour ${pool}: ${success_count}/3 vérifications réussies"
+        return 1
+    fi
+}
+
+# Vérification de l'existence d'une erreur critique récente (anti-ping-pong)
+check_recent_critical_error() {
+    local pool="$1"
+    local error_file="${STATE_DIR}/critical-errors-${pool}.txt"
+
+    if [[ ! -f "$error_file" ]]; then
+        # Pas d'erreur précédente
+        return 1
+    fi
+
+    # Lire le timestamp epoch de la dernière erreur
+    local last_error_epoch
+    last_error_epoch=$(grep "^epoch=" "$error_file" | cut -d= -f2)
+
+    if [[ -z "$last_error_epoch" ]]; then
+        # Fichier corrompu ou format invalide
+        return 1
+    fi
+
+    # Calculer le temps écoulé depuis la dernière erreur
+    local current_epoch
+    current_epoch=$(date +%s)
+    local time_diff=$((current_epoch - last_error_epoch))
+
+    if [[ $time_diff -lt $HEALTH_CHECK_ERROR_COOLDOWN ]]; then
+        # Erreur récente (< 1 heure par défaut)
+        log "warning" "Erreur critique récente détectée: il y a ${time_diff}s (seuil: ${HEALTH_CHECK_ERROR_COOLDOWN}s)"
+        return 0
+    else
+        # Erreur ancienne (> 1 heure)
+        log "info" "Dernière erreur critique: il y a ${time_diff}s (> seuil de ${HEALTH_CHECK_ERROR_COOLDOWN}s)"
+        return 1
+    fi
+}
+
+# Enregistrement d'une erreur critique
+record_critical_error() {
+    local pool="$1"
+    local reason="$2"
+    local action="$3"  # "lxc_migrated" ou "lxc_stopped" ou "lxc_stopped_failsafe"
+    local error_file="${STATE_DIR}/critical-errors-${pool}.txt"
+
+    # Créer le répertoire d'état si nécessaire
+    mkdir -p "$STATE_DIR"
+
+    # Créer ou écraser le fichier d'erreur
+    cat > "$error_file" <<EOF
+timestamp=$(date '+%Y-%m-%d_%H:%M:%S')
+epoch=$(date +%s)
+reason=${reason}
+action=${action}
+target_node=${REMOTE_NODE_NAME}
+EOF
+
+    # Définir les permissions
+    chmod 600 "$error_file"
+    chown root:root "$error_file" 2>/dev/null
+
+    log "error" "Erreur critique enregistrée pour ${pool}: ${reason} → ${action}"
+}
+
+# Gestion de l'échec de santé - Migration ou arrêt du LXC
+handle_health_failure() {
+    local pool="$1"
+    local failure_reason="$2"
+
+    # Log box pour visibilité maximale
+    log "error" "╔════════════════════════════════════════════════════════════╗"
+    log "error" "║ ÉCHEC CRITIQUE DE SANTÉ POUR ${pool}"
+    log "error" "║ Raison: ${failure_reason}"
+    log "error" "╚════════════════════════════════════════════════════════════╝"
+
+    # Vérifier s'il y a eu une erreur récente (mécanisme anti-ping-pong)
+    if check_recent_critical_error "$pool"; then
+        local last_error_time
+        last_error_time=$(grep "^timestamp=" "${STATE_DIR}/critical-errors-${pool}.txt" | cut -d= -f2)
+
+        log "error" "Erreur critique récente détectée (${last_error_time})"
+        log "error" "Action: ARRÊT du LXC ${CTID} pour éviter ping-pong"
+
+        # Arrêter le LXC
+        if pct stop "$CTID" 2>&1 | while read -r line; do log "info" "$line"; done; then
+            log "error" "✓ LXC ${CTID} arrêté avec succès"
+            record_critical_error "$pool" "$failure_reason" "lxc_stopped"
+            return 0
+        else
+            log "error" "✗ Échec de l'arrêt du LXC ${CTID}"
+            record_critical_error "$pool" "$failure_reason" "lxc_stop_failed"
+            return 1
+        fi
+    else
+        # Première erreur ou erreur ancienne (> 1 heure)
+        log "warning" "Première erreur ou erreur ancienne (> ${HEALTH_CHECK_ERROR_COOLDOWN}s)"
+        log "warning" "Action: MIGRATION du LXC ${CTID} vers ${REMOTE_NODE_NAME}"
+
+        # Tenter la migration via HA
+        if ha-manager migrate "ct:${CTID}" "$REMOTE_NODE_NAME" 2>&1 | while read -r line; do log "info" "$line"; done; then
+            log "warning" "✓ Migration HA initiée vers ${REMOTE_NODE_NAME}"
+            record_critical_error "$pool" "$failure_reason" "lxc_migrated"
+            return 0
+        else
+            log "error" "✗ Échec de la migration HA vers ${REMOTE_NODE_NAME}"
+            log "error" "Tentative d'arrêt du LXC en dernier recours"
+
+            # Fallback: arrêter le LXC si la migration échoue
+            if pct stop "$CTID" 2>&1 | while read -r line; do log "info" "$line"; done; then
+                log "error" "✓ LXC ${CTID} arrêté en dernier recours"
+                record_critical_error "$pool" "$failure_reason" "lxc_stopped_failsafe"
+                return 0
+            else
+                log "error" "✗ Échec critique: impossible de migrer ou d'arrêter le LXC ${CTID}"
+                record_critical_error "$pool" "$failure_reason" "all_actions_failed"
+                return 1
+            fi
+        fi
+    fi
+}
+
+# Orchestrateur principal de vérification de santé d'un pool
+verify_pool_health() {
+    local pool="$1"
+
+    export CURRENT_POOL="$pool"
+    log "info" "=========================================="
+    log "info" "Vérification de santé du pool: ${pool}"
+    log "info" "=========================================="
+
+    # Étape 1: Initialiser le tracking des disques si nécessaire
+    local uuids_file="${STATE_DIR}/disk-uuids-${pool}.txt"
+    if [[ ! -f "$uuids_file" ]] || ! grep -q "^initialized=true" "$uuids_file" 2>/dev/null; then
+        log "info" "Première exécution: initialisation du suivi des disques pour ${pool}"
+
+        if ! init_disk_tracking "$pool"; then
+            log "warning" "Impossible d'initialiser le suivi des disques pour ${pool}"
+            log "info" "Continuation sans vérification des disques (pool virtuel possible)"
+            # Ne pas échouer pour les pools virtuels
+            return 0
+        fi
+    fi
+
+    # Étape 2: Triple vérification de santé
+    if ! triple_health_check "$pool"; then
+        log "error" "Triple vérification de santé échouée pour ${pool}"
+
+        # Déterminer la raison de l'échec pour un message d'erreur précis
+        local failure_reason="Vérification de santé échouée"
+
+        # Tenter de déterminer la cause spécifique
+        if ! verify_disk_presence "$pool"; then
+            failure_reason="Disque(s) manquant(s) détecté(s)"
+        elif ! check_pool_health_status "$pool"; then
+            # Obtenir plus de détails sur le problème de pool
+            local pool_health
+            pool_health=$(zpool list -H -o health "$pool" 2>/dev/null)
+            if [[ "$pool_health" != "ONLINE" ]]; then
+                failure_reason="Pool en état ${pool_health}"
+            else
+                failure_reason="État du pool non nominal (espace disque ou erreurs I/O)"
+            fi
+        fi
+
+        # Gérer l'échec (migration ou arrêt du LXC)
+        handle_health_failure "$pool" "$failure_reason"
+        return 1
+    fi
+
+    log "info" "✓ Vérification de santé réussie pour ${pool}"
     return 0
 }
 
@@ -651,6 +1094,29 @@ if ! ssh -i "$SSH_KEY" -o ConnectTimeout=5 -o BatchMode=yes "root@${REMOTE_NODE_
 fi
 
 log "info" "Connexion SSH vers ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP}) vérifiée"
+
+# Vérification de santé des pools
+log "info" "=========================================="
+log "info" "Vérification de santé des pools"
+log "info" "=========================================="
+
+HEALTH_CHECK_FAILED=false
+for pool in "${ZPOOLS[@]}"; do
+    if ! verify_pool_health "$pool"; then
+        log "error" "Vérification de santé échouée pour ${pool}"
+        HEALTH_CHECK_FAILED=true
+    fi
+done
+
+# Arrêt si échec de santé détecté
+if [[ "$HEALTH_CHECK_FAILED" == "true" ]]; then
+    export CURRENT_POOL="global"
+    log "error" "Arrêt du script suite à échec(s) de vérification de santé"
+    log "error" "Le LXC a été migré ou arrêté pour protection"
+    exit 1
+fi
+
+log "info" "✓ Tous les pools sont en bonne santé"
 
 # Compteurs globaux
 POOLS_TOTAL=${#ZPOOLS[@]}
