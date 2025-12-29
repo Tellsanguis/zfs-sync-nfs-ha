@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="2.3.1"
+SCRIPT_VERSION="2.3.2"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -506,16 +506,31 @@ get_pool_disk_uuids() {
         fi
 
         # Chercher les liens dans /dev/disk/by-id/ pointant vers ce device
-        # Méthode optimisée: ls -l au lieu de find
-        local found_uuids
-        found_uuids=$(ls -l /dev/disk/by-id/ 2>/dev/null | \
-                      awk -v target="$(basename "$device_real")" '$NF == target {print $(NF-2)}' | \
-                      grep -E '^(wwn-|ata-|scsi-|nvme-)' || true)
+        local all_ids
+        all_ids=$(ls -l /dev/disk/by-id/ 2>/dev/null | \
+                  awk -v target="$(basename "$device_real")" '$NF ~ "/"target"$" || $NF == target {print $(NF-2)}' || true)
 
-        if [[ -n "$found_uuids" ]]; then
-            while read -r uuid_name; do
-                uuids+=("$uuid_name")
-            done <<< "$found_uuids"
+        if [[ -z "$all_ids" ]]; then
+            log "warning" "Aucun identifiant by-id trouvé pour ${device_real} (disque très ancien?)"
+            continue
+        fi
+
+        # Priorité 1: WWN (World Wide Name - identifiant unique matériel)
+        local found_wwn
+        found_wwn=$(echo "$all_ids" | grep '^wwn-' | head -n1 || true)
+
+        if [[ -n "$found_wwn" ]]; then
+            uuids+=("$found_wwn")
+        else
+            # Priorité 2: ata-/scsi-/nvme- selon le type de disque
+            local found_alt
+            found_alt=$(echo "$all_ids" | grep -E '^(ata-|scsi-|nvme-)' | head -n1 || true)
+
+            if [[ -n "$found_alt" ]]; then
+                uuids+=("$found_alt")
+            else
+                log "warning" "Aucun identifiant stable trouvé pour ${device_real}"
+            fi
         fi
     done <<< "$devices"
 
