@@ -4,10 +4,7 @@ on:
   push:
     branches:
       - main
-      - 2.1
-  pull_request:
-    branches:
-      - main
+  workflow_dispatch:
 
 jobs:
   tests:
@@ -20,8 +17,8 @@ jobs:
 
       - name: Installation de BATS
         run: |
-          sudo apt-get update
-          sudo apt-get install -y bats
+          apt-get update
+          apt-get install -y bats
 
       - name: Afficher version BATS
         run: bats --version
@@ -30,14 +27,6 @@ jobs:
         run: |
           cd tests
           bats *.bats
-
-      - name: Upload résultats des tests
-        if: always()
-        uses: actions/upload-artifact@v3
-        with:
-          name: test-results
-          path: tests/*.log
-          retention-days: 7
 
   shellcheck:
     name: Vérification ShellCheck
@@ -49,8 +38,8 @@ jobs:
 
       - name: Installation de ShellCheck
         run: |
-          sudo apt-get update
-          sudo apt-get install -y shellcheck
+          apt-get update
+          apt-get install -y shellcheck
 
       - name: Afficher version ShellCheck
         run: shellcheck --version

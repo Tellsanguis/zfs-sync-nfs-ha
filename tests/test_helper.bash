@@ -231,6 +231,7 @@ create_disk_uuid_file() {
     local pool="$1"
     local uuid="${2:-wwn-0x5000cca2dfe2e414}"
 
+    mkdir -p "${STATE_DIR}"
     cat > "${STATE_DIR}/disk-uuids-${pool}.txt" <<EOF
 initialized=true
 timestamp=2024-12-29_14:00:00
@@ -246,6 +247,7 @@ create_critical_error_file() {
     local pool="$1"
     local epoch="${2:-${TEST_CURRENT_EPOCH:-1735481400}}"
 
+    mkdir -p "${STATE_DIR}"
     cat > "${STATE_DIR}/critical-errors-${pool}.txt" <<EOF
 timestamp=2024-12-29_14:00:00
 epoch=${epoch}
