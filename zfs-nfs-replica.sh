@@ -52,6 +52,11 @@ LOG_RETENTION_DAYS=14
 HEALTH_CHECK_MIN_FREE_SPACE=5  # Pourcentage minimum d'espace libre
 HEALTH_CHECK_ERROR_COOLDOWN=3600  # Anti-ping-pong: 1 heure en secondes
 
+# Configuration des notifications Proxmox
+NOTIFICATION_ENABLED=true  # Activer/désactiver les notifications
+NOTIFICATION_MODE="INFO"  # "INFO" (toutes les notifs) ou "ERROR" (erreurs uniquement)
+# Note: Configurer les notification targets dans Proxmox GUI: Datacenter > Notifications
+
 # Initialiser le répertoire de logs
 init_logging() {
     mkdir -p "$LOG_DIR"
@@ -92,6 +97,54 @@ log() {
         echo "$message" >> "${LOG_DIR}/${pool}.log"
     else
         echo "$message" >> "${LOG_DIR}/general.log"
+    fi
+}
+
+# Fonction d'envoi de notifications Proxmox
+send_notification() {
+    local severity="$1"  # "info" ou "error"
+    local title="$2"
+    local message="$3"
+
+    # Vérifier si les notifications sont activées
+    if [[ "${NOTIFICATION_ENABLED}" != "true" ]]; then
+        return 0
+    fi
+
+    # Filtrer selon le mode de notification
+    if [[ "${NOTIFICATION_MODE}" == "ERROR" ]] && [[ "$severity" != "error" ]]; then
+        # Mode ERROR: ignorer les notifications info
+        return 0
+    fi
+
+    # Préparer le corps du message
+    local hostname
+    hostname=$(hostname)
+    local timestamp
+    timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+
+    local full_message="[${hostname}] [${timestamp}]
+${message}
+
+Script: zfs-nfs-replica v${SCRIPT_VERSION}
+Nœud: ${hostname}"
+
+    # Tenter d'envoyer via le système de notifications Proxmox
+    # Pour Proxmox VE 8+/9.x, utiliser pvesh avec le système de notifications
+    if command -v pvesh >/dev/null 2>&1; then
+        # Essayer d'envoyer via l'API Proxmox
+        # Note: Nécessite configuration d'un notification target dans Proxmox GUI
+        pvesh create /cluster/notifications/targets/sendmail/notify \
+            --severity "$severity" \
+            --title "ZFS NFS HA: ${title}" \
+            --body "$full_message" \
+            >/dev/null 2>&1 || {
+            # Si pvesh échoue (pas de target configuré), logger en warning
+            log "warning" "Notification non envoyée (configurer notification target dans Proxmox GUI)"
+        }
+    else
+        # Fallback si pvesh n'existe pas (ne devrait pas arriver sur Proxmox)
+        log "warning" "pvesh non disponible - notifications désactivées"
     fi
 }
 
@@ -348,28 +401,32 @@ get_pool_disk_uuids() {
         return 0
     fi
 
-    # Pour chaque device, résoudre vers /dev/disk/by-id/
+    # Pour chaque device, résoudre vers /dev/disk/by-id/ (méthode optimisée)
     local uuids=()
     while read -r device; do
         if [[ -z "$device" ]]; then
             continue
         fi
 
-        # Résoudre le device vers ses liens dans /dev/disk/by-id/
-        local device_id
-        device_id=$(find /dev/disk/by-id/ -type l -exec readlink -f {} \; 2>/dev/null | \
-                    grep -F "$(readlink -f "$device" 2>/dev/null)" | \
-                    head -1)
+        # Résoudre le device réel
+        local device_real
+        device_real=$(readlink -f "$device" 2>/dev/null)
 
-        if [[ -n "$device_id" ]]; then
-            # Extraire juste le nom du fichier (wwn-*, ata-*, etc.)
-            local uuid_name
-            uuid_name=$(basename "$device_id")
+        if [[ -z "$device_real" ]]; then
+            continue
+        fi
 
-            # Filtrer pour ne garder que les identifiants persistants
-            if [[ "$uuid_name" =~ ^(wwn-|ata-|scsi-|nvme-) ]]; then
+        # Chercher les liens dans /dev/disk/by-id/ pointant vers ce device
+        # Méthode optimisée: ls -l au lieu de find
+        local found_uuids
+        found_uuids=$(ls -l /dev/disk/by-id/ 2>/dev/null | \
+                      awk -v target="$(basename "$device_real")" '$NF == target {print $(NF-2)}' | \
+                      grep -E '^(wwn-|ata-|scsi-|nvme-)' || true)
+
+        if [[ -n "$found_uuids" ]]; then
+            while read -r uuid_name; do
                 uuids+=("$uuid_name")
-            fi
+            done <<< "$found_uuids"
         fi
     done <<< "$devices"
 
@@ -483,6 +540,11 @@ verify_disk_presence() {
 
     if [[ $missing_disks -gt 0 ]]; then
         log "error" "✗ ${missing_disks} disque(s) manquant(s) pour ${pool}"
+        send_notification "error" "Disque(s) manquant(s) - ${pool}" \
+            "${missing_disks} disque(s) manquant(s) détecté(s) pour le pool ${pool}.
+
+Vérifier les connexions USB/SATA et l'état des disques.
+Une migration automatique du LXC peut être déclenchée."
         return 1
     else
         log "info" "✓ Tous les disques présents pour ${pool}"
@@ -506,6 +568,11 @@ check_pool_health_status() {
 
     if [[ "$pool_health" != "ONLINE" ]]; then
         log "error" "Pool ${pool} en état dégradé: ${pool_health}"
+        send_notification "error" "Pool ZFS ${pool_health} - ${pool}" \
+            "Le pool ZFS ${pool} est en état ${pool_health}.
+
+Vérifier l'état des disques avec: zpool status ${pool}
+Une migration automatique du LXC peut être déclenchée."
         health_issues=$((health_issues + 1))
     else
         log "info" "✓ Pool ${pool} status: ONLINE"
@@ -520,6 +587,13 @@ check_pool_health_status() {
 
         if [[ $capacity -ge $min_capacity ]]; then
             log "error" "Espace disque critique pour ${pool}: ${capacity}% utilisé (seuil: ${min_capacity}%)"
+            send_notification "error" "Espace disque critique - ${pool}" \
+                "Le pool ${pool} est presque plein: ${capacity}% utilisé.
+
+Seuil critique: ${min_capacity}%
+Espace libre restant: $((100 - capacity))%
+
+ACTION REQUISE: Libérer de l'espace ou agrandir le pool."
             health_issues=$((health_issues + 1))
         else
             local free_percent=$((100 - capacity))
@@ -732,8 +806,6 @@ triple_health_check() {
             log "info" "Vérification santé #${i}/3 réussie pour ${pool}"
         else
             log "error" "Vérification santé #${i}/3 échouée pour ${pool}"
-            # Ne pas continuer si une vérification échoue
-            return 1
         fi
 
         # Délai entre les vérifications (sauf après la dernière)
@@ -832,8 +904,16 @@ handle_health_failure() {
         log "error" "Action: ARRÊT du LXC ${CTID} pour éviter ping-pong"
 
         # Arrêter le LXC
-        if pct stop "$CTID" 2>&1 | while read -r line; do log "info" "$line"; done; then
+        if pct stop "$CTID" >/dev/null 2>&1; then
             log "error" "✓ LXC ${CTID} arrêté avec succès"
+            send_notification "error" "Arrêt LXC (anti-ping-pong)" \
+                "Le LXC ${CTID} a été arrêté pour éviter un ping-pong.
+
+Pool: ${pool}
+Raison: ${failure_reason}
+Erreur précédente: ${last_error_time}
+
+ACTION REQUISE: Vérifier l'état des disques et pools sur les deux nœuds avant de redémarrer le LXC."
             record_critical_error "$pool" "$failure_reason" "lxc_stopped"
             return 0
         else
@@ -847,8 +927,17 @@ handle_health_failure() {
         log "warning" "Action: MIGRATION du LXC ${CTID} vers ${REMOTE_NODE_NAME}"
 
         # Tenter la migration via HA
-        if ha-manager migrate "ct:${CTID}" "$REMOTE_NODE_NAME" 2>&1 | while read -r line; do log "info" "$line"; done; then
+        if ha-manager migrate "ct:${CTID}" "$REMOTE_NODE_NAME" >/dev/null 2>&1; then
             log "warning" "✓ Migration HA initiée vers ${REMOTE_NODE_NAME}"
+            send_notification "error" "Migration LXC vers ${REMOTE_NODE_NAME}" \
+                "Le LXC ${CTID} a été migré vers ${REMOTE_NODE_NAME} suite à un problème de santé.
+
+Pool: ${pool}
+Raison: ${failure_reason}
+Nœud source: $(hostname)
+Nœud destination: ${REMOTE_NODE_NAME}
+
+Le service NFS devrait continuer à fonctionner sur le nœud distant."
             record_critical_error "$pool" "$failure_reason" "lxc_migrated"
             return 0
         else
@@ -856,7 +945,7 @@ handle_health_failure() {
             log "error" "Tentative d'arrêt du LXC en dernier recours"
 
             # Fallback: arrêter le LXC si la migration échoue
-            if pct stop "$CTID" 2>&1 | while read -r line; do log "info" "$line"; done; then
+            if pct stop "$CTID" >/dev/null 2>&1; then
                 log "error" "✓ LXC ${CTID} arrêté en dernier recours"
                 record_critical_error "$pool" "$failure_reason" "lxc_stopped_failsafe"
                 return 0
@@ -1149,8 +1238,23 @@ log "info" "=========================================="
 
 if [[ $POOLS_FAILED -eq 0 ]]; then
     log "info" "✓ Toutes les réplications ont réussi"
+    send_notification "info" "Réplication ZFS réussie" \
+        "Toutes les réplications ZFS ont réussi.
+
+Pools répliqués: ${POOLS_TOTAL}
+Succès: ${POOLS_SUCCESS}
+Nœud actif: $(hostname)
+Nœud distant: ${REMOTE_NODE_NAME}"
     exit 0
 else
     log "error" "✗ ${POOLS_FAILED} pool(s) ont échoué"
+    send_notification "error" "Échec réplication ZFS" \
+        "${POOLS_FAILED} pool(s) ont échoué lors de la réplication.
+
+Total: ${POOLS_TOTAL}
+Succès: ${POOLS_SUCCESS}
+Échecs: ${POOLS_FAILED}
+
+Vérifier les logs: /var/log/zfs-nfs-replica/"
     exit 1
 fi
