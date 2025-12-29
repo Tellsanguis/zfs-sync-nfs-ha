@@ -24,11 +24,11 @@
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="2.2.0"
+SCRIPT_VERSION="2.3.0"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
-AUTO_UPDATE_ENABLED=true  # Mettre à false pour désactiver l'auto-update
+AUTO_UPDATE_ENABLED=false  # Mettre à true pour activer l'auto-update
 
 # Configuration du container LXC
 CTID=103
@@ -61,28 +61,22 @@ LOG_RETENTION_DAYS=14
 HEALTH_CHECK_MIN_FREE_SPACE=5  # Pourcentage minimum d'espace libre
 HEALTH_CHECK_ERROR_COOLDOWN=3600  # Anti-ping-pong: 1 heure en secondes
 
-# Configuration des notifications via Apprise
+# Configuration des notifications via Apprise (valeurs par défaut)
+# Ces valeurs peuvent être surchargées par /etc/zfs-nfs-replica/config
 NOTIFICATION_ENABLED=true  # Activer/désactiver les notifications
 NOTIFICATION_MODE="INFO"  # "INFO" (toutes les notifs) ou "ERROR" (erreurs uniquement)
-
-# URLs Apprise (séparées par des espaces) - Exemples:
-# Discord: discord://webhook_id/webhook_token
-# Telegram: tgram://bot_token/chat_id
-# Gotify: gotify://hostname/token
-# Email: mailto://user:pass@smtp.domain.com
-# Ntfy: ntfy://topic ou ntfy://hostname/topic
-# Slack: slack://TokenA/TokenB/TokenC
-# Voir https://github.com/caronc/apprise pour plus de services
-APPRISE_URLS=""  # Configurer vos URLs ici
-
-# Exemples d'utilisation:
-# APPRISE_URLS="discord://webhook_id/token"
-# APPRISE_URLS="discord://id/token gotify://server/token"
-# APPRISE_URLS="mailto://user:pass@gmail.com tgram://bot_token/chat_id"
+APPRISE_URLS=""  # URLs Apprise séparées par des espaces
 
 # Configuration environnement Python pour Apprise
 APPRISE_VENV_DIR="${STATE_DIR}/venv"  # Répertoire du virtualenv Python
 APPRISE_BIN="${APPRISE_VENV_DIR}/bin/apprise"  # Binaire Apprise dans le venv
+
+# Charger la configuration externe si elle existe
+CONFIG_FILE="/etc/zfs-nfs-replica/config"
+if [[ -f "$CONFIG_FILE" ]]; then
+    # shellcheck source=/dev/null
+    source "$CONFIG_FILE"
+fi
 
 # Initialiser le répertoire de logs
 init_logging() {
@@ -137,22 +131,21 @@ setup_apprise_venv() {
     if [[ ! -d "$APPRISE_VENV_DIR" ]]; then
         log "info" "Création de l'environnement Python virtuel pour Apprise..."
 
-        # Créer le virtualenv (python3 et venv sont préinstallés sur Proxmox)
-        if ! python3 -m venv "$APPRISE_VENV_DIR" 2>/dev/null; then
+        # Créer le virtualenv
+        if ! python3 -m venv "$APPRISE_VENV_DIR" 2>&1 | grep -q "not created successfully"; then
+            log "info" "✓ Virtualenv créé: ${APPRISE_VENV_DIR}"
+        else
             log "error" "Échec de la création du virtualenv"
+            log "error" "Installer le paquet: apt install python3-venv ou python3.13-venv"
             return 1
         fi
+    fi
 
-        log "info" "✓ Virtualenv créé: ${APPRISE_VENV_DIR}"
-
-        # Installer pip dans le venv (pas installé par défaut sur Proxmox)
-        log "info" "Installation de pip dans le virtualenv..."
-        if ! "${APPRISE_VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1; then
-            log "error" "Échec de l'installation de pip"
-            return 1
-        fi
-
-        log "info" "✓ Pip installé dans le virtualenv"
+    # Vérifier que pip existe dans le venv
+    if [[ ! -f "${APPRISE_VENV_DIR}/bin/pip" ]]; then
+        log "error" "Pip non trouvé dans le virtualenv"
+        log "error" "Le venv n'a pas été créé correctement. Supprimer ${APPRISE_VENV_DIR} et réessayer."
+        return 1
     fi
 
     # Vérifier si Apprise est installé dans le venv
@@ -160,7 +153,7 @@ setup_apprise_venv() {
         log "info" "Installation d'Apprise dans le virtualenv..."
 
         # Installer Apprise via pip du venv
-        if "${APPRISE_VENV_DIR}/bin/pip" install --quiet apprise 2>/dev/null; then
+        if "${APPRISE_VENV_DIR}/bin/pip" install --quiet apprise; then
             log "info" "✓ Apprise installé avec succès"
         else
             log "error" "Échec de l'installation d'Apprise"
@@ -1269,7 +1262,7 @@ fi
 # Déterminer le nœud distant et son IP
 # Vérifier que le nœud local est dans la configuration
 if [[ ! -v "CLUSTER_NODES[$LOCAL_NODE]" ]]; then
-    local valid_nodes="${!CLUSTER_NODES[@]}"
+    valid_nodes="${!CLUSTER_NODES[@]}"
     log "error" "Nœud inconnu: ${LOCAL_NODE}. Nœuds valides: ${valid_nodes}"
     exit 1
 fi

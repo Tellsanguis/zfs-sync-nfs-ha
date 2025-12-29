@@ -1,0 +1,70 @@
+#!/bin/bash
+#
+# Configuration des notifications pour zfs-nfs-replica.sh
+# Copier ce fichier vers /etc/zfs-nfs-replica/config et modifier selon vos besoins
+#
+# Installation:
+#   sudo mkdir -p /etc/zfs-nfs-replica
+#   sudo cp config.example /etc/zfs-nfs-replica/config
+#   sudo nano /etc/zfs-nfs-replica/config
+#
+
+# ============================================================================
+# NOTIFICATIONS
+# ============================================================================
+
+# Activer/désactiver les notifications
+NOTIFICATION_ENABLED=true
+
+# Mode de notification:
+#   "INFO"  - Envoie toutes les notifications (démarrages, succès, erreurs)
+#   "ERROR" - Envoie uniquement les erreurs critiques
+NOTIFICATION_MODE="INFO"
+
+# URLs Apprise (séparées par des espaces)
+# Documentation complète: https://github.com/caronc/apprise
+#
+# Exemples de services supportés:
+#
+# Discord:
+#   APPRISE_URLS="discord://webhook_id/webhook_token"
+#
+# Telegram:
+#   APPRISE_URLS="tgram://bot_token/chat_id"
+#
+# Gotify:
+#   APPRISE_URLS="gotify://hostname/token"
+#
+# Ntfy:
+#   APPRISE_URLS="ntfy://topic"
+#   APPRISE_URLS="ntfy://hostname/topic"
+#
+# Email (SMTP):
+#   APPRISE_URLS="mailto://user:password@smtp.gmail.com"
+#
+# Slack:
+#   APPRISE_URLS="slack://TokenA/TokenB/TokenC"
+#
+# Pushover:
+#   APPRISE_URLS="pover://user@token"
+#
+# Multiple services (séparer par des espaces):
+#   APPRISE_URLS="discord://id/token gotify://server/token tgram://bot/chat"
+#
+APPRISE_URLS=""
+
+# ============================================================================
+# EXEMPLES D'UTILISATION
+# ============================================================================
+
+# Exemple 1: Discord uniquement
+# APPRISE_URLS="discord://1234567890/AbCdEfGhIjKlMnOpQrStUvWxYz"
+
+# Exemple 2: Telegram + Gotify
+# APPRISE_URLS="tgram://123456789:ABCdefGHIjklMNOpqrsTUVwxyz/987654321 gotify://gotify.example.com/AaBbCcDdEe"
+
+# Exemple 3: Email Gmail
+# APPRISE_URLS="mailto://mon.email@gmail.com:mot_de_passe_app@smtp.gmail.com"
+
+# Exemple 4: Ntfy (self-hosted)
+# APPRISE_URLS="ntfy://ntfy.example.com/zfs-alerts"
