@@ -159,6 +159,57 @@ Le script intègre un système de sécurité à deux niveaux pour éviter la per
 
 Ces protections garantissent qu'un disque vide ne pourra jamais écraser accidentellement des données existantes.
 
+### Health Checks des Disques Physiques
+
+Le script intègre un système complet de vérification de santé des pools ZFS pour détecter proactivement les défaillances matérielles :
+
+**Triple vérification de santé** (sur nœud actif et passif) :
+1. **Présence des disques** : Vérifie que tous les disques physiques trackés via leur WWN (World Wide Name) ou identifiant ata-/scsi-/nvme- sont présents
+2. **État du pool** : Contrôle que le pool est ONLINE (pas DEGRADED ou FAULTED)
+3. **Espace libre** : Vérifie que l'espace libre est supérieur au seuil minimum (défaut: 5%)
+4. **Erreurs I/O** : Détecte les erreurs de lecture/écriture/checksum sur les vdevs
+
+**Tracking des disques** :
+- Les disques sont identifiés par leur **WWN (World Wide Name)** en priorité pour garantir l'unicité
+- Fallback sur les identifiants ata-/scsi-/nvme- si pas de WWN disponible
+- Fichiers d'état : `/var/lib/zfs-nfs-replica/disk-uuids-{pool}.txt`
+- Initialisation automatique au premier run
+
+**Migration automatique en cas d'erreur critique** :
+- Si un problème matériel est détecté sur le nœud actif, le LXC est automatiquement migré vers le nœud sain
+- **Protection anti-ping-pong** : Cooldown de 1 heure pour éviter les migrations en boucle
+- Notifications envoyées avant et après migration
+
+### Système de Notifications via Apprise
+
+Le script intègre [Apprise](https://github.com/caronc/apprise) pour envoyer des notifications sur 90+ services différents :
+
+**Services supportés** (exemples) :
+- Discord, Telegram, Slack
+- Gotify, Ntfy, Pushover
+- Email (SMTP, Gmail, etc.)
+- SMS (Twilio, AWS SNS, etc.)
+- Et beaucoup d'autres...
+
+**Configuration** :
+- Fichier de configuration externe : `/etc/zfs-nfs-replica/config`
+- Exemple fourni : `config.example`
+- Les paramètres persistent entre les mises à jour du script
+
+**Modes de notification** :
+- **INFO** : Toutes les notifications (démarrages, succès, erreurs)
+- **ERROR** : Uniquement les erreurs critiques
+
+**Types de notifications** :
+- Réplication réussie (mode INFO uniquement)
+- Pool dégradé détecté
+- Disque(s) manquant(s)
+- Migration automatique du LXC déclenchée
+- Échec de réplication
+
+**Installation** :
+Apprise s'installe automatiquement dans un environnement Python virtuel isolé lors de la première exécution.
+
 ## Fonctionnalités
 
 - **Mise à jour automatique** : Le script vérifie et installe automatiquement les nouvelles versions depuis le dépôt Forgejo avant chaque exécution
@@ -166,6 +217,9 @@ Ces protections garantissent qu'un disque vide ne pourra jamais écraser acciden
 - **Détection automatique première sync/incrémentale** : Bascule automatiquement entre mode initial et mode incrémental
 - **Configuration dynamique de Sanoid** : Configure automatiquement Sanoid en mode actif ou passif selon le rôle du nœud, conformément aux recommandations de la documentation officielle
 - **Double protection anti-écrasement** : Vérifications de cohérence des tailles et historique pour prévenir toute perte de données
+- **Health checks des disques physiques** : Triple vérification de santé des pools ZFS avec détection des disques manquants, pools dégradés, erreurs I/O et espace libre insuffisant
+- **Notifications intelligentes via Apprise** : Système de notifications universel supportant 90+ services (Discord, Telegram, Gotify, Email, etc.) avec modes INFO et ERROR
+- **Migration automatique en cas de défaillance** : Détecte les problèmes matériels critiques et migre automatiquement le LXC vers le nœud sain avec protection anti-ping-pong
 - **Synchronisation récursive du pool** : Tous les datasets sous `zpool1` sont automatiquement inclus
 - **Contrôle de concurrence par verrou** : Empêche les tâches de réplication simultanées
 - **Gestion d'erreurs complète** : Valide la connectivité SSH, l'existence du pool et les opérations ZFS
@@ -178,9 +232,10 @@ Ces protections garantissent qu'un disque vide ne pourra jamais écraser acciden
 ```
 .
 ├── README.md                    # Ce fichier
-├── zfs-nfs-replica.sh           # Script principal de réplication (version 1.7.0)
+├── zfs-nfs-replica.sh           # Script principal de réplication (version 2.3.2)
 ├── zfs-nfs-replica.service      # Définition du service systemd
-└── zfs-nfs-replica.timer        # Configuration du timer systemd
+├── zfs-nfs-replica.timer        # Configuration du timer systemd
+└── config.example               # Exemple de configuration pour les notifications
 ```
 
 ### Système de Mise à Jour Automatique
@@ -264,6 +319,12 @@ ha-manager migrate ct:103 elitedesk
   mp0: /zpool1/data-nfs-share,mp=/data-nfs-share,shared=1
   ```
 - Sanoid/Syncoid installés depuis le dépôt officiel Sanoid
+- **Python 3.13+ avec venv** : Requis pour le système de notifications Apprise
+  ```bash
+  # Sur Debian/Proxmox
+  apt install python3.13-venv
+  # Ou version plus récente selon votre distribution
+  ```
 - Paire de clés SSH dédiée pour la réplication
 - Conteneur LXC avec rootfs sur LINSTOR/DRBD
 - Configuration Proxmox HA avec paramètres de priorité appropriés
