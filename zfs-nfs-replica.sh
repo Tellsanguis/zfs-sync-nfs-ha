@@ -52,10 +52,28 @@ LOG_RETENTION_DAYS=14
 HEALTH_CHECK_MIN_FREE_SPACE=5  # Pourcentage minimum d'espace libre
 HEALTH_CHECK_ERROR_COOLDOWN=3600  # Anti-ping-pong: 1 heure en secondes
 
-# Configuration des notifications Proxmox
+# Configuration des notifications via Apprise
 NOTIFICATION_ENABLED=true  # Activer/désactiver les notifications
 NOTIFICATION_MODE="INFO"  # "INFO" (toutes les notifs) ou "ERROR" (erreurs uniquement)
-# Note: Configurer les notification targets dans Proxmox GUI: Datacenter > Notifications
+
+# URLs Apprise (séparées par des espaces) - Exemples:
+# Discord: discord://webhook_id/webhook_token
+# Telegram: tgram://bot_token/chat_id
+# Gotify: gotify://hostname/token
+# Email: mailto://user:pass@smtp.domain.com
+# Ntfy: ntfy://topic ou ntfy://hostname/topic
+# Slack: slack://TokenA/TokenB/TokenC
+# Voir https://github.com/caronc/apprise pour plus de services
+APPRISE_URLS=""  # Configurer vos URLs ici
+
+# Exemples d'utilisation:
+# APPRISE_URLS="discord://webhook_id/token"
+# APPRISE_URLS="discord://id/token gotify://server/token"
+# APPRISE_URLS="mailto://user:pass@gmail.com tgram://bot_token/chat_id"
+
+# Configuration environnement Python pour Apprise
+APPRISE_VENV_DIR="${STATE_DIR}/venv"  # Répertoire du virtualenv Python
+APPRISE_BIN="${APPRISE_VENV_DIR}/bin/apprise"  # Binaire Apprise dans le venv
 
 # Initialiser le répertoire de logs
 init_logging() {
@@ -100,7 +118,61 @@ log() {
     fi
 }
 
-# Fonction d'envoi de notifications Proxmox
+# Initialisation de l'environnement Python pour Apprise
+# Note: Le venv est persistant dans /var/lib/zfs-nfs-replica/venv
+setup_apprise_venv() {
+    # Créer le répertoire d'état si nécessaire
+    mkdir -p "$STATE_DIR"
+
+    # Vérifier si le venv existe déjà
+    if [[ ! -d "$APPRISE_VENV_DIR" ]]; then
+        log "info" "Création de l'environnement Python virtuel pour Apprise..."
+
+        # Créer le virtualenv (python3 et venv sont préinstallés sur Proxmox)
+        if ! python3 -m venv "$APPRISE_VENV_DIR" 2>/dev/null; then
+            log "error" "Échec de la création du virtualenv"
+            return 1
+        fi
+
+        log "info" "✓ Virtualenv créé: ${APPRISE_VENV_DIR}"
+
+        # Installer pip dans le venv (pas installé par défaut sur Proxmox)
+        log "info" "Installation de pip dans le virtualenv..."
+        if ! "${APPRISE_VENV_DIR}/bin/python" -m ensurepip --upgrade >/dev/null 2>&1; then
+            log "error" "Échec de l'installation de pip"
+            return 1
+        fi
+
+        log "info" "✓ Pip installé dans le virtualenv"
+    fi
+
+    # Vérifier si Apprise est installé dans le venv
+    if [[ ! -f "$APPRISE_BIN" ]]; then
+        log "info" "Installation d'Apprise dans le virtualenv..."
+
+        # Installer Apprise via pip du venv
+        if "${APPRISE_VENV_DIR}/bin/pip" install --quiet apprise 2>/dev/null; then
+            log "info" "✓ Apprise installé avec succès"
+        else
+            log "error" "Échec de l'installation d'Apprise"
+            log "error" "Essayer manuellement: ${APPRISE_VENV_DIR}/bin/pip install apprise"
+            return 1
+        fi
+    fi
+
+    # Vérifier que Apprise fonctionne
+    if [[ -x "$APPRISE_BIN" ]]; then
+        local apprise_version
+        apprise_version=$("$APPRISE_BIN" --version 2>/dev/null | head -1)
+        log "info" "✓ Apprise prêt: ${apprise_version}"
+        return 0
+    else
+        log "error" "Apprise installé mais non exécutable"
+        return 1
+    fi
+}
+
+# Fonction d'envoi de notifications via Apprise
 send_notification() {
     local severity="$1"  # "info" ou "error"
     local title="$2"
@@ -111,10 +183,22 @@ send_notification() {
         return 0
     fi
 
+    # Vérifier si des URLs Apprise sont configurées
+    if [[ -z "${APPRISE_URLS}" ]]; then
+        return 0
+    fi
+
     # Filtrer selon le mode de notification
     if [[ "${NOTIFICATION_MODE}" == "ERROR" ]] && [[ "$severity" != "error" ]]; then
         # Mode ERROR: ignorer les notifications info
         return 0
+    fi
+
+    # Vérifier si Apprise est installé dans le venv
+    if [[ ! -x "$APPRISE_BIN" ]]; then
+        log "warning" "Apprise non disponible - notifications désactivées"
+        log "warning" "Le virtualenv n'a pas été correctement initialisé"
+        return 1
     fi
 
     # Préparer le corps du message
@@ -129,22 +213,25 @@ ${message}
 Script: zfs-nfs-replica v${SCRIPT_VERSION}
 Nœud: ${hostname}"
 
-    # Tenter d'envoyer via le système de notifications Proxmox
-    # Pour Proxmox VE 8+/9.x, utiliser pvesh avec le système de notifications
-    if command -v pvesh >/dev/null 2>&1; then
-        # Essayer d'envoyer via l'API Proxmox
-        # Note: Nécessite configuration d'un notification target dans Proxmox GUI
-        pvesh create /cluster/notifications/targets/sendmail/notify \
-            --severity "$severity" \
-            --title "ZFS NFS HA: ${title}" \
-            --body "$full_message" \
-            >/dev/null 2>&1 || {
-            # Si pvesh échoue (pas de target configuré), logger en warning
-            log "warning" "Notification non envoyée (configurer notification target dans Proxmox GUI)"
-        }
+    # Déterminer le type de notification Apprise selon la sévérité
+    local notification_type="info"
+    if [[ "$severity" == "error" ]]; then
+        notification_type="warning"  # Apprise utilise "warning" pour les erreurs critiques
+    fi
+
+    # Envoyer la notification à tous les services configurés
+    # apprise supporte plusieurs URLs séparées par des espaces
+    if "$APPRISE_BIN" \
+        --notification-type="$notification_type" \
+        --title="ZFS NFS HA: ${title}" \
+        --body="$full_message" \
+        ${APPRISE_URLS} \
+        >/dev/null 2>&1; then
+        log "info" "Notification envoyée avec succès"
+        return 0
     else
-        # Fallback si pvesh n'existe pas (ne devrait pas arriver sur Proxmox)
-        log "warning" "pvesh non disponible - notifications désactivées"
+        log "warning" "Échec d'envoi de la notification via Apprise"
+        return 1
     fi
 }
 
@@ -1145,6 +1232,25 @@ log "info" "=========================================="
 
 # Vérifier les mises à jour (avant toute opération)
 auto_update "$@"
+
+# Vérifier et initialiser la configuration des notifications
+if [[ "${NOTIFICATION_ENABLED}" == "true" ]] && [[ -n "${APPRISE_URLS}" ]]; then
+    log "info" "Initialisation du système de notifications..."
+
+    # Initialiser l'environnement Python et installer Apprise si nécessaire
+    if setup_apprise_venv; then
+        local url_count
+        url_count=$(echo "${APPRISE_URLS}" | wc -w)
+        log "info" "✓ Notifications activées: ${url_count} service(s) configuré(s)"
+        log "info" "  Mode: ${NOTIFICATION_MODE}"
+    else
+        log "warning" "Échec de l'initialisation d'Apprise - notifications désactivées"
+        NOTIFICATION_ENABLED=false
+    fi
+elif [[ "${NOTIFICATION_ENABLED}" == "true" ]] && [[ -z "${APPRISE_URLS}" ]]; then
+    log "info" "Notifications activées mais aucune URL Apprise configurée (APPRISE_URLS vide)"
+    log "info" "Configurer APPRISE_URLS dans le script pour recevoir des notifications"
+fi
 
 # Déterminer le nœud distant et son IP
 case "$LOCAL_NODE" in
