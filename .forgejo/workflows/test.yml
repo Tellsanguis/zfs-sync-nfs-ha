@@ -2,9 +2,12 @@ name: Tests et Vérifications
 
 on:
   push:
-    branches: [ main, 2.1 ]
+    branches:
+      - main
+      - 2.1
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
 
 jobs:
   tests:
@@ -13,7 +16,7 @@ jobs:
 
     steps:
       - name: Checkout du code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Installation de BATS
         run: |
@@ -42,7 +45,7 @@ jobs:
 
     steps:
       - name: Checkout du code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Installation de ShellCheck
         run: |
@@ -66,7 +69,7 @@ jobs:
 
     steps:
       - name: Checkout du code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Vérifier syntaxe du script principal
         run: |
