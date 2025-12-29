@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 # Script de réplication ZFS automatique pour NFS HA (Multi-pools)
-# À déployer sur acemagician et elitedesk
+# À déployer sur tous les nœuds de production du cluster Proxmox
 #
 # Ce script version 2.1 :
 # - Supporte la réplication de plusieurs pools ZFS simultanément
@@ -30,12 +30,21 @@ SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
 AUTO_UPDATE_ENABLED=true  # Mettre à false pour désactiver l'auto-update
 
+# Configuration du container LXC
 CTID=103
 CONTAINER_NAME="nfs-server"
 
 # Support multi-pools - Liste des pools à répliquer
 # Ajouter ou retirer des pools selon vos besoins
 ZPOOLS=("zpool1" "zpool2")
+
+# Configuration des nœuds du cluster
+# Format: NODE_NAME:IP_ADDRESS
+# Ajouter tous les nœuds de production du cluster
+declare -A CLUSTER_NODES=(
+    ["acemagician"]="192.168.100.10"
+    ["elitedesk"]="192.168.100.20"
+)
 
 CHECK_DELAY=2  # Délai entre chaque vérification (secondes)
 LOG_FACILITY="local0"
@@ -1219,6 +1228,11 @@ replicate_pool() {
 # SCRIPT PRINCIPAL
 ################################################################################
 
+# Ne pas exécuter le script principal si on est en mode test BATS
+if [[ "${BATS_TEST_MODE:-false}" == "true" ]]; then
+    return 0 2>/dev/null || exit 0
+fi
+
 # Initialiser le système de logs
 init_logging
 
@@ -1253,20 +1267,29 @@ elif [[ "${NOTIFICATION_ENABLED}" == "true" ]] && [[ -z "${APPRISE_URLS}" ]]; th
 fi
 
 # Déterminer le nœud distant et son IP
-case "$LOCAL_NODE" in
-    "acemagician")
-        REMOTE_NODE_NAME="elitedesk"
-        REMOTE_NODE_IP="192.168.100.20"
-        ;;
-    "elitedesk")
-        REMOTE_NODE_NAME="acemagician"
-        REMOTE_NODE_IP="192.168.100.10"
-        ;;
-    *)
-        log "error" "Nœud inconnu: ${LOCAL_NODE}. Ce script doit s'exécuter sur acemagician ou elitedesk."
-        exit 1
-        ;;
-esac
+# Vérifier que le nœud local est dans la configuration
+if [[ ! -v "CLUSTER_NODES[$LOCAL_NODE]" ]]; then
+    local valid_nodes="${!CLUSTER_NODES[@]}"
+    log "error" "Nœud inconnu: ${LOCAL_NODE}. Nœuds valides: ${valid_nodes}"
+    exit 1
+fi
+
+# Trouver le nœud distant (le premier nœud différent du local)
+REMOTE_NODE_NAME=""
+REMOTE_NODE_IP=""
+for node in "${!CLUSTER_NODES[@]}"; do
+    if [[ "$node" != "$LOCAL_NODE" ]]; then
+        REMOTE_NODE_NAME="$node"
+        REMOTE_NODE_IP="${CLUSTER_NODES[$node]}"
+        break
+    fi
+done
+
+# Vérifier qu'un nœud distant a été trouvé
+if [[ -z "$REMOTE_NODE_NAME" ]]; then
+    log "error" "Aucun nœud distant trouvé dans CLUSTER_NODES. Vérifier la configuration."
+    exit 1
+fi
 
 log "info" "Nœud distant configuré: ${REMOTE_NODE_NAME} (${REMOTE_NODE_IP})"
 log "info" "Pools configurés: ${ZPOOLS[*]}"

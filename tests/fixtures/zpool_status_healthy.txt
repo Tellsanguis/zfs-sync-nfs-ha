@@ -1,0 +1,10 @@
+  pool: zpool1
+ state: ONLINE
+  scan: scrub repaired 0B in 0 days 02:15:32 with 0 errors on Sun Dec 15 02:39:32 2024
+config:
+
+	NAME                                   STATE     READ WRITE CKSUM
+	zpool1                                 ONLINE       0     0     0
+	  /dev/disk/by-id/wwn-0x5000cca2dfe2e414  ONLINE       0     0     0
+
+errors: No known data errors
