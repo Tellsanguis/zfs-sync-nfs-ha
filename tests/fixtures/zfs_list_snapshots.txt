@@ -1,0 +1,9 @@
+NAME                                                    USED  AVAIL     REFER  MOUNTPOINT
+zpool1                                                 5.12T  2.55T      192K  /zpool1
+zpool1/data-nfs-share                                  4.89T  2.55T     4.89T  /zpool1/data-nfs-share
+zpool1/data-nfs-share@autosnap_2024-12-29_14:00:00      128M      -     4.89T  -
+zpool1/data-nfs-share@autosnap_2024-12-29_14:15:00      256M      -     4.89T  -
+zpool1/data-nfs-share@autosnap_2024-12-29_14:30:00       64M      -     4.89T  -
+zpool1/pbs-backups                                      230G  2.55T      230G  /zpool1/pbs-backups
+zpool1/pbs-backups@autosnap_2024-12-29_14:00:00         10M      -      230G  -
+zpool1/pbs-backups@autosnap_2024-12-29_14:15:00         15M      -      230G  -

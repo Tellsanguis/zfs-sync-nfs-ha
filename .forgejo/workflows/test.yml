@@ -1,0 +1,105 @@
+name: Tests et Vérifications
+
+on:
+  push:
+    branches: [ main, 2.1 ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  tests:
+    name: Tests unitaires BATS
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v3
+
+      - name: Installation de BATS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bats
+
+      - name: Afficher version BATS
+        run: bats --version
+
+      - name: Exécuter tests unitaires
+        run: |
+          cd tests
+          bats *.bats
+
+      - name: Upload résultats des tests
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: tests/*.log
+          retention-days: 7
+
+  shellcheck:
+    name: Vérification ShellCheck
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v3
+
+      - name: Installation de ShellCheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Afficher version ShellCheck
+        run: shellcheck --version
+
+      - name: Vérifier le script principal
+        run: |
+          shellcheck -x zfs-nfs-replica.sh || true
+
+      - name: Vérifier les scripts de test
+        run: |
+          shellcheck -x tests/*.bash || true
+
+  syntax:
+    name: Vérification syntaxe Bash
+    runs-on: self-hosted
+
+    steps:
+      - name: Checkout du code
+        uses: actions/checkout@v3
+
+      - name: Vérifier syntaxe du script principal
+        run: |
+          bash -n zfs-nfs-replica.sh
+
+      - name: Vérifier syntaxe des helpers de test
+        run: |
+          bash -n tests/test_helper.bash
+
+  summary:
+    name: Résumé des tests
+    runs-on: self-hosted
+    needs: [tests, shellcheck, syntax]
+    if: always()
+
+    steps:
+      - name: Afficher résumé
+        run: |
+          echo "=========================================="
+          echo "RÉSUMÉ DES TESTS"
+          echo "=========================================="
+          echo ""
+          echo "Tests unitaires: ${{ needs.tests.result }}"
+          echo "ShellCheck: ${{ needs.shellcheck.result }}"
+          echo "Syntaxe Bash: ${{ needs.syntax.result }}"
+          echo ""
+
+          if [[ "${{ needs.tests.result }}" == "success" ]] && \
+             [[ "${{ needs.shellcheck.result }}" == "success" ]] && \
+             [[ "${{ needs.syntax.result }}" == "success" ]]; then
+            echo "✓ Tous les tests sont passés avec succès"
+            exit 0
+          else
+            echo "✗ Certains tests ont échoué"
+            exit 1
+          fi
