@@ -24,7 +24,7 @@
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="2.3.0"
+SCRIPT_VERSION="2.3.1"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -1246,7 +1246,6 @@ if [[ "${NOTIFICATION_ENABLED}" == "true" ]] && [[ -n "${APPRISE_URLS}" ]]; then
 
     # Initialiser l'environnement Python et installer Apprise si nécessaire
     if setup_apprise_venv; then
-        local url_count
         url_count=$(echo "${APPRISE_URLS}" | wc -w)
         log "info" "✓ Notifications activées: ${url_count} service(s) configuré(s)"
         log "info" "  Mode: ${NOTIFICATION_MODE}"
