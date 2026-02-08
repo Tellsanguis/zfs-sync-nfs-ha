@@ -18,13 +18,13 @@
 # - Fichiers d'état séparés par pool (tailles, UUIDs disques, erreurs critiques)
 #
 # Auteur : BENE Maël
-# Version : 2.1.0
+# Version : 2.4.1
 #
 
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="2.3.2"
+SCRIPT_VERSION="2.4.1"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -52,6 +52,11 @@ SSH_KEY="/root/.ssh/id_ed25519_zfs_replication"
 STATE_DIR="/var/lib/zfs-nfs-replica"
 SIZE_TOLERANCE=20  # Tolérance de variation en pourcentage (±20%)
 MIN_REMOTE_RATIO=50  # Le distant doit avoir au moins 50% de la taille du local
+
+# Configuration de limitation de bande passante
+# Limite le débit de transfert en MB/s (mégaoctets par seconde)
+# Mettre à 0 ou laisser vide pour désactiver la limitation
+BANDWIDTH_LIMIT_MBS=40  # Limite par défaut: 40 MB/s
 
 # Configuration des logs (rotation 2 semaines)
 LOG_DIR="/var/log/zfs-nfs-replica"
@@ -1180,6 +1185,14 @@ replicate_pool() {
         fi
 
         syncoid_opts="--recursive --force-delete"
+    fi
+
+    # Configuration de la limitation de bande passante (option native syncoid)
+    if [[ -n "${BANDWIDTH_LIMIT_MBS}" ]] && [[ "${BANDWIDTH_LIMIT_MBS}" -gt 0 ]]; then
+        # Convertir MB/s en bytes/s pour syncoid (--source-bwlimit attend des bytes)
+        local bandwidth_bytes=$((BANDWIDTH_LIMIT_MBS * 1024 * 1024))
+        syncoid_opts="${syncoid_opts} --source-bwlimit=${bandwidth_bytes}"
+        log "info" "Limitation de bande passante activée: ${BANDWIDTH_LIMIT_MBS} MB/s"
     fi
 
     # Lister les datasets de premier niveau sous le pool
