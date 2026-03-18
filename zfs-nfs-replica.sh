@@ -18,13 +18,13 @@
 # - Fichiers d'état séparés par pool (tailles, UUIDs disques, erreurs critiques)
 #
 # Auteur : BENE Maël
-# Version : 2.4.1
+# Version : 2.4.2
 #
 
 set -euo pipefail
 
 # Configuration
-SCRIPT_VERSION="2.4.1"
+SCRIPT_VERSION="2.4.2"
 REPO_URL="https://forgejo.tellserv.fr/Tellsanguis/zfs-sync-nfs-ha"
 SCRIPT_URL="${REPO_URL}/raw/branch/main/zfs-nfs-replica.sh"
 SCRIPT_PATH="${BASH_SOURCE[0]}"
@@ -57,6 +57,11 @@ MIN_REMOTE_RATIO=50  # Le distant doit avoir au moins 50% de la taille du local
 # Limite le débit de transfert en MB/s (mégaoctets par seconde)
 # Mettre à 0 ou laisser vide pour désactiver la limitation
 BANDWIDTH_LIMIT_MBS=40  # Limite par défaut: 40 MB/s
+
+# Datasets à exclure de la réplication syncoid (gérés par un autre outil, ex: Proxmox Replication)
+# Format: noms courts des datasets (sans le nom du pool)
+# Exemple: EXCLUDE_DATASETS=("pbs-backups" "vm-100-disk-0")
+EXCLUDE_DATASETS=("pbs-backups")
 
 # Configuration des logs (rotation 2 semaines)
 LOG_DIR="/var/log/zfs-nfs-replica"
@@ -1198,6 +1203,14 @@ replicate_pool() {
     # Lister les datasets de premier niveau sous le pool
     local first_level_datasets
     first_level_datasets=$(zfs list -H -o name -r "$pool" -t filesystem,volume -d 1 | grep -v "^${pool}$")
+
+    # Appliquer les exclusions définies dans EXCLUDE_DATASETS
+    if [[ ${#EXCLUDE_DATASETS[@]} -gt 0 ]]; then
+        for excl in "${EXCLUDE_DATASETS[@]}"; do
+            first_level_datasets=$(grep -v "^${pool}/${excl}$" <<< "$first_level_datasets")
+            log "info" "Dataset exclu: ${pool}/${excl}"
+        done
+    fi
 
     if [[ -z "$first_level_datasets" ]]; then
         log "error" "Aucun dataset trouvé sous ${pool}"
